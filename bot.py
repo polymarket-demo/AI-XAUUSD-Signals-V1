@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 # ============================================================
 # AI XAUUSD SIGNALS V1
 # STEP 3 - LIVE PRICE -> M5 CANDLES -> TREND ENGINE
+# TEST MODE: 10 M5 CANDLES
 # ============================================================
 
 API_URL = "https://xaus.com/api/v1/spot"
@@ -18,6 +19,7 @@ print("========================================")
 print("AI XAUUSD SIGNALS V1")
 print("LIVE XAU/USD -> M5 CANDLES")
 print("TREND ENGINE -> EMA20 / EMA50")
+print("TEST MODE -> 10 M5 CANDLES")
 print("========================================")
 
 
@@ -41,7 +43,12 @@ def get_live_xau_price():
     data = response.json()
 
     price = float(data["spot_usd_oz"])
-    price_time = data.get("price_as_of", "")
+
+    price_time = data.get(
+        "price_as_of",
+        ""
+    )
+
     status = data.get(
         "data_state",
         {}
@@ -108,14 +115,33 @@ def update_candle(price):
 
 def calculate_ema(values, period):
 
-    if len(values) < period:
+    if len(values) == 0:
         return None
+
+    # Provisional EMA when fewer values than the period
+    if len(values) < period:
+
+        ema = values[0]
+
+        multiplier = 2 / (period + 1)
+
+        for price in values[1:]:
+
+            ema = (
+                (price - ema) * multiplier
+            ) + ema
+
+        return ema
+
+    # Normal EMA
+    ema = sum(
+        values[:period]
+    ) / period
 
     multiplier = 2 / (period + 1)
 
-    ema = sum(values[:period]) / period
-
     for price in values[period:]:
+
         ema = (
             (price - ema) * multiplier
         ) + ema
@@ -129,15 +155,30 @@ def calculate_ema(values, period):
 
 def calculate_trend():
 
-    if len(prices) < 10"
+    candle_count = len(prices)
 
-        print("")
-        print("TREND ENGINE: WAITING")
+    print("")
+    print("========================================")
+    print("TREND ENGINE")
+    print("========================================")
+
+    print(
+        "M5 CANDLES:",
+        candle_count,
+        "/ 10"
+    )
+
+    # Need 10 completed candles for this test
+    if candle_count < 10:
+
+        print("TREND: WAITING")
         print(
-            "M5 CANDLES:",
-            len(prices),
-            "/ 10"
+            "Need:",
+            10 - candle_count,
+            "more M5 candles"
         )
+
+        print("========================================")
 
         return
 
@@ -155,11 +196,6 @@ def calculate_trend():
         closes,
         50
     )
-
-    if ema20 is None or ema50 is None:
-
-        print("TREND ENGINE: WAITING")
-        return
 
     current_price = closes[-1]
 
@@ -179,11 +215,6 @@ def calculate_trend():
 
         trend = "NEUTRAL"
 
-    print("")
-    print("========================================")
-    print("TREND ENGINE")
-    print("========================================")
-
     print(
         "PRICE :",
         round(current_price, 4)
@@ -202,6 +233,14 @@ def calculate_trend():
     print(
         "TREND :",
         trend
+    )
+
+    print(
+        "STATUS: PROVISIONAL"
+    )
+
+    print(
+        "Reason: only 10 M5 candles available"
     )
 
     print("========================================")
@@ -224,6 +263,7 @@ while True:
             print("STATUS:", status)
 
             time.sleep(30)
+
             continue
 
         timestamp = datetime.fromisoformat(
@@ -250,7 +290,9 @@ while True:
                 timestamp
             )
 
-            print("M5 CANDLE: STARTED")
+            print(
+                "M5 CANDLE: STARTED"
+            )
 
         else:
 
@@ -298,7 +340,7 @@ while True:
 
                 print("========================================")
 
-                # Add completed candle
+                # Save completed candle
                 prices.append(
                     current_candle.copy()
                 )
@@ -308,16 +350,10 @@ while True:
 
                     prices.pop(0)
 
-                # =================================================
-                # TREND ENGINE
-                # =================================================
-
+                # Run Trend Engine
                 calculate_trend()
 
-                # =================================================
-                # START NEW CANDLE
-                # =================================================
-
+                # Start next candle
                 start_new_candle(
                     price,
                     timestamp
@@ -329,7 +365,9 @@ while True:
 
             else:
 
-                update_candle(price)
+                update_candle(
+                    price
+                )
 
                 print(
                     "M5 CURRENT:",
