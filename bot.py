@@ -10,7 +10,10 @@ data = yf.download(
 if data.empty:
     print("ERRORE: nessun dato")
 else:
-    close = data["Close"]
+    if hasattr(data.columns, "levels"):
+        close = data["Close"].iloc[:, 0]
+    else:
+        close = data["Close"]
 
     ema20 = close.ewm(span=20).mean().iloc[-1]
     ema50 = close.ewm(span=50).mean().iloc[-1]
