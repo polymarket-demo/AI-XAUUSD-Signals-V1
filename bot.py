@@ -129,14 +129,14 @@ def calculate_ema(values, period):
 
 def calculate_trend():
 
-    if len(prices) < 10:
+    if len(prices) < 10"
 
         print("")
         print("TREND ENGINE: WAITING")
         print(
             "M5 CANDLES:",
             len(prices),
-            "/ 10:
+            "/ 10"
         )
 
         return
