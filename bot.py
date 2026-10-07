@@ -29,7 +29,6 @@ FIB_382 = 0.382
 FIB_500 = 0.500
 FIB_618 = 0.618
 
-# Tolleranza per riconoscere il prezzo vicino a un livello Fibonacci
 FIB_TOLERANCE = 0.30
 
 print("========================================")
@@ -61,7 +60,9 @@ def get_live_xau_price():
 
     data = response.json()
 
-    price = float(data["spot_usd_oz"])
+    price = float(
+        data["spot_usd_oz"]
+    )
 
     price_time = data.get(
         "price_as_of",
@@ -90,9 +91,13 @@ def start_new_candle(price, timestamp):
 
     minute = timestamp.minute
 
-    candle_start_minute = (minute // 5) * 5
+    candle_start_minute = (
+        minute // 5
+    ) * 5
 
-    current_candle_minute = candle_start_minute
+    current_candle_minute = (
+        candle_start_minute
+    )
 
     current_candle = {
         "time": timestamp.replace(
@@ -135,32 +140,42 @@ def update_candle(price):
 def calculate_ema(values, period):
 
     if len(values) == 0:
+
         return None
 
+    # Provisional EMA when fewer values than period
     if len(values) < period:
 
         ema = values[0]
 
-        multiplier = 2 / (period + 1)
+        multiplier = (
+            2 / (period + 1)
+        )
 
         for price in values[1:]:
 
             ema = (
-                (price - ema) * multiplier
+                (price - ema)
+                * multiplier
             ) + ema
 
         return ema
+
+    # Normal EMA
 
     ema = sum(
         values[:period]
     ) / period
 
-    multiplier = 2 / (period + 1)
+    multiplier = (
+        2 / (period + 1)
+    )
 
     for price in values[period:]:
 
         ema = (
-            (price - ema) * multiplier
+            (price - ema)
+            * multiplier
         ) + ema
 
     return ema
@@ -175,6 +190,28 @@ def calculate_trend():
     candle_count = len(prices)
 
     if candle_count < TEST_CANDLES:
+
+        print("")
+        print("========================================")
+        print("TREND ENGINE")
+        print("========================================")
+
+        print(
+            "M5 CANDLES:",
+            candle_count,
+            "/",
+            TEST_CANDLES
+        )
+
+        print("TREND: WAITING")
+
+        print(
+            "Need:",
+            TEST_CANDLES - candle_count,
+            "more M5 candles"
+        )
+
+        print("========================================")
 
         return None
 
@@ -195,11 +232,17 @@ def calculate_trend():
 
     current_price = closes[-1]
 
-    if ema20 > ema50 and current_price > ema20:
+    if (
+        ema20 > ema50
+        and current_price > ema20
+    ):
 
         trend = "BUY"
 
-    elif ema20 < ema50 and current_price < ema20:
+    elif (
+        ema20 < ema50
+        and current_price < ema20
+    ):
 
         trend = "SELL"
 
@@ -241,6 +284,10 @@ def calculate_trend():
         "STATUS: PROVISIONAL"
     )
 
+    print(
+        "Reason: test dataset still limited"
+    )
+
     print("========================================")
 
     return trend
@@ -253,9 +300,12 @@ def calculate_trend():
 def calculate_fibonacci(trend):
 
     if len(prices) < SWING_LOOKBACK:
+
         return None
 
-    candles = prices[-SWING_LOOKBACK:]
+    candles = prices[
+        -SWING_LOOKBACK:
+    ]
 
     swing_high = max(
         candle["high"]
@@ -268,42 +318,45 @@ def calculate_fibonacci(trend):
     )
 
     if swing_high <= swing_low:
+
         return None
 
-    movement = swing_high - swing_low
-
-    # BUY:
-    # pullback da HIGH verso LOW
-    #
-    # SELL:
-    # pullback da LOW verso HIGH
+    movement = (
+        swing_high - swing_low
+    )
 
     if trend == "BUY":
 
-        fib382 = swing_high - (
-            movement * FIB_382
+        fib382 = (
+            swing_high
+            - movement * FIB_382
         )
 
-        fib500 = swing_high - (
-            movement * FIB_500
+        fib500 = (
+            swing_high
+            - movement * FIB_500
         )
 
-        fib618 = swing_high - (
-            movement * FIB_618
+        fib618 = (
+            swing_high
+            - movement * FIB_618
         )
 
     elif trend == "SELL":
 
-        fib382 = swing_low + (
-            movement * FIB_382
+        fib382 = (
+            swing_low
+            + movement * FIB_382
         )
 
-        fib500 = swing_low + (
-            movement * FIB_500
+        fib500 = (
+            swing_low
+            + movement * FIB_500
         )
 
-        fib618 = swing_low + (
-            movement * FIB_618
+        fib618 = (
+            swing_low
+            + movement * FIB_618
         )
 
     else:
@@ -326,6 +379,7 @@ def calculate_fibonacci(trend):
 def check_pullback(trend, fib):
 
     if fib is None:
+
         return False, None
 
     candle = prices[-1]
@@ -348,7 +402,10 @@ def check_pullback(trend, fib):
             price - level
         )
 
-        if closest_distance is None or distance < closest_distance:
+        if (
+            closest_distance is None
+            or distance < closest_distance
+        ):
 
             closest_distance = distance
             closest_name = name
@@ -371,42 +428,50 @@ def check_pullback(trend, fib):
 def check_confirmation(trend):
 
     if len(prices) < 2:
+
         return False
 
     previous = prices[-2]
+
     current = prices[-1]
 
-    # BUY confirmation:
-    # candela rialzista e close sopra il massimo
-    # della candela precedente
+    # BUY confirmation
 
     if trend == "BUY":
 
         bullish = (
-            current["close"] > current["open"]
+            current["close"]
+            > current["open"]
         )
 
         breakout = (
-            current["close"] > previous["high"]
+            current["close"]
+            > previous["high"]
         )
 
-        return bullish and breakout
+        return (
+            bullish
+            and breakout
+        )
 
-    # SELL confirmation:
-    # candela ribassista e close sotto il minimo
-    # della candela precedente
+    # SELL confirmation
 
     if trend == "SELL":
 
         bearish = (
-            current["close"] < current["open"]
+            current["close"]
+            < current["open"]
         )
 
         breakout = (
-            current["close"] < previous["low"]
+            current["close"]
+            < previous["low"]
         )
 
-        return bearish and breakout
+        return (
+            bearish
+            and breakout
+        )
 
     return False
 
@@ -417,7 +482,11 @@ def check_confirmation(trend):
 
 def analyze_signal(trend):
 
-    if trend not in ["BUY", "SELL"]:
+    if trend not in [
+        "BUY",
+        "SELL"
+    ]:
+
         return
 
     fib = calculate_fibonacci(
@@ -425,18 +494,25 @@ def analyze_signal(trend):
     )
 
     if fib is None:
+
         return
 
-    pullback, fib_info = check_pullback(
-        trend,
-        fib
+    pullback, fib_info = (
+        check_pullback(
+            trend,
+            fib
+        )
     )
 
-    confirmation = check_confirmation(
-        trend
+    confirmation = (
+        check_confirmation(
+            trend
+        )
     )
 
-    current_price = prices[-1]["close"]
+    current_price = (
+        prices[-1]["close"]
+    )
 
     print("")
     print("========================================")
@@ -479,24 +555,34 @@ def analyze_signal(trend):
             "NEAREST FIB:",
             fib_info[0],
             "LEVEL",
-            round(fib_info[1], 4)
+            round(
+                fib_info[1],
+                4
+            )
         )
 
     print(
         "PULLBACK   :",
-        "YES" if pullback else "NO"
+        "YES"
+        if pullback
+        else "NO"
     )
 
     print(
         "CONFIRM    :",
-        "YES" if confirmation else "NO"
+        "YES"
+        if confirmation
+        else "NO"
     )
 
     # ========================================================
     # NO SIGNAL
     # ========================================================
 
-    if not pullback or not confirmation:
+    if (
+        not pullback
+        or not confirmation
+    ):
 
         print(
             "SIGNAL     : WAIT"
@@ -506,7 +592,9 @@ def analyze_signal(trend):
             "MODE       : ANALYSIS ONLY"
         )
 
-        print("========================================")
+        print(
+            "========================================"
+        )
 
         return
 
@@ -525,15 +613,25 @@ def analyze_signal(trend):
             fib["low"]
         )
 
-        risk = entry - sl
+        risk = (
+            entry - sl
+        )
 
         if risk <= 0:
-            print("SIGNAL     : INVALID")
-            print("========================================")
+
+            print(
+                "SIGNAL     : INVALID"
+            )
+
+            print(
+                "========================================"
+            )
+
             return
 
-        tp = entry + (
-            risk * RISK_REWARD
+        tp = (
+            entry
+            + risk * RISK_REWARD
         )
 
         signal = "BUY"
@@ -545,15 +643,25 @@ def analyze_signal(trend):
             fib["high"]
         )
 
-        risk = sl - entry
+        risk = (
+            sl - entry
+        )
 
         if risk <= 0:
-            print("SIGNAL     : INVALID")
-            print("========================================")
+
+            print(
+                "SIGNAL     : INVALID"
+            )
+
+            print(
+                "========================================"
+            )
+
             return
 
-        tp = entry - (
-            risk * RISK_REWARD
+        tp = (
+            entry
+            - risk * RISK_REWARD
         )
 
         signal = "SELL"
@@ -595,8 +703,13 @@ def analyze_signal(trend):
         "MODE       : ANALYSIS ONLY"
     )
 
-    print("*************************************")
-    print("========================================")
+    print(
+        "*************************************"
+    )
+
+    print(
+        "========================================"
+    )
 
 
 # ============================================================
@@ -607,30 +720,51 @@ while True:
 
     try:
 
-        price, price_time, status = get_live_xau_price()
+        price, price_time, status = (
+            get_live_xau_price()
+        )
 
         if status != "fresh":
 
             print("")
-            print("WARNING: XAU DATA NOT FRESH")
-            print("STATUS:", status)
+            print(
+                "WARNING: XAU DATA NOT FRESH"
+            )
+
+            print(
+                "STATUS:",
+                status
+            )
 
             time.sleep(30)
 
             continue
 
-        timestamp = datetime.fromisoformat(
-            price_time.replace(
-                "Z",
-                "+00:00"
+        timestamp = (
+            datetime.fromisoformat(
+                price_time.replace(
+                    "Z",
+                    "+00:00"
+                )
             )
         )
 
         print("")
         print("----------------------------------------")
-        print("LIVE PRICE:", price)
-        print("TIME:", price_time)
-        print("STATUS:", status)
+        print(
+            "LIVE PRICE:",
+            price
+        )
+
+        print(
+            "TIME:",
+            price_time
+        )
+
+        print(
+            "STATUS:",
+            status
+        )
 
         # ====================================================
         # FIRST PRICE
@@ -647,6 +781,11 @@ while True:
                 "M5 CANDLE: STARTED"
             )
 
+            print(
+                "M5 OPEN:",
+                price
+            )
+
         else:
 
             minute = timestamp.minute
@@ -659,7 +798,14 @@ while True:
             # NEW M5 CANDLE
             # =================================================
 
-            if candle_minute != current_candle_minute:
+            if (
+                candle_minute
+                != current_candle_minute
+            ):
+
+                # ---------------------------------------------
+                # COMPLETE PREVIOUS CANDLE
+                # ---------------------------------------------
 
                 print("")
                 print("========================================")
@@ -668,30 +814,42 @@ while True:
 
                 print(
                     "TIME :",
-                    current_candle["time"].isoformat()
+                    current_candle[
+                        "time"
+                    ].isoformat()
                 )
 
                 print(
                     "OPEN :",
-                    current_candle["open"]
+                    current_candle[
+                        "open"
+                    ]
                 )
 
                 print(
                     "HIGH :",
-                    current_candle["high"]
+                    current_candle[
+                        "high"
+                    ]
                 )
 
                 print(
                     "LOW  :",
-                    current_candle["low"]
+                    current_candle[
+                        "low"
+                    ]
                 )
 
                 print(
                     "CLOSE:",
-                    current_candle["close"]
+                    current_candle[
+                        "close"
+                    ]
                 )
 
-                print("========================================")
+                print(
+                    "========================================"
+                )
 
                 # Save completed candle
 
@@ -699,17 +857,13 @@ while True:
                     current_candle.copy()
                 )
 
-                # Keep last 50 candles
-
                 if len(prices) > 50:
 
                     prices.pop(0)
 
-                # Trend
+                # Analyze completed candle
 
                 trend = calculate_trend()
-
-                # Full AI analysis
 
                 if trend is not None:
 
@@ -717,7 +871,10 @@ while True:
                         trend
                     )
 
-                # Start next candle
+                # ---------------------------------------------
+                # START NEW CANDLE
+                # The current price is the OPEN of the new M5
+                # ---------------------------------------------
 
                 start_new_candle(
                     price,
@@ -728,6 +885,11 @@ while True:
                     "NEW M5 CANDLE: STARTED"
                 )
 
+                print(
+                    "NEW M5 OPEN:",
+                    price
+                )
+
             else:
 
                 update_candle(
@@ -736,10 +898,18 @@ while True:
 
                 print(
                     "M5 CURRENT:",
-                    current_candle["open"],
-                    current_candle["high"],
-                    current_candle["low"],
-                    current_candle["close"]
+                    current_candle[
+                        "open"
+                    ],
+                    current_candle[
+                        "high"
+                    ],
+                    current_candle[
+                        "low"
+                    ],
+                    current_candle[
+                        "close"
+                    ]
                 )
 
         print("----------------------------------------")
@@ -747,6 +917,9 @@ while True:
     except Exception as e:
 
         print("")
-        print("ERROR:", e)
+        print(
+            "ERROR:",
+            e
+        )
 
     time.sleep(30)
