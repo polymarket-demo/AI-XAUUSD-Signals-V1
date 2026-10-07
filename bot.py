@@ -1,178 +1,156 @@
 import os
 import json
 import time
-import threading
-from datetime import datetime, timezone
-
 import websocket
 
-
 API_KEY = os.getenv("SIFTING_API_KEY")
+
+if not API_KEY:
+    print("ERROR: SIFTING_API_KEY is missing.")
+    raise SystemExit(1)
+
+print("Starting LIVE DATA ENGINE...")
+print("API KEY: CONFIGURED")
+print("API KEY VALUE: HIDDEN")
+print("=" * 60)
+print("AI XAUUSD SIGNALS V1")
+print("LIVE DATA ENGINE V1")
+print("=" * 60)
 
 WS_URL = f"wss://stream.sifting.io/ws/v1?key={API_KEY}"
 
 SYMBOL = "XAUUSD"
 PRODUCT = "com"
 
-PING_INTERVAL = 30
-STALE_SECONDS = 10
-
-
 last_tick_time = None
-last_price = None
-last_bid = None
-last_ask = None
-
-m5 = {
-    "start": None,
-    "open": None,
-    "high": None,
-    "low": None,
-    "close": None,
-}
+last_ping_time = 0
 
 
-def utc_now():
-    return datetime.now(timezone.utc)
+def send_ping(ws):
+    global last_ping_time
 
+    message = {
+        "op": "ping"
+    }
 
-def print_status():
-    if last_tick_time is None:
-        return
+    ws.send(json.dumps(message))
+    last_ping_time = time.time()
 
-    age = time.time() - last_tick_time
-
-    status = "FRESH" if age <= STALE_SECONDS else "STALE"
-
-    print(
-        f"[DATA] "
-        f"PRICE={last_price} "
-        f"BID={last_bid} "
-        f"ASK={last_ask} "
-        f"AGE={age:.2f}s "
-        f"STATUS={status}"
-    )
-
-
-def update_m5(price, tick_time):
-    global m5
-
-    dt = datetime.fromtimestamp(tick_time, timezone.utc)
-
-    minute = (dt.minute // 5) * 5
-
-    candle_start = dt.replace(
-        minute=minute,
-        second=0,
-        microsecond=0
-    )
-
-    if m5["start"] != candle_start:
-
-        if m5["start"] is not None:
-            print(
-                f"[M5 CLOSED] "
-                f"{m5['start'].isoformat()} "
-                f"O={m5['open']} "
-                f"H={m5['high']} "
-                f"L={m5['low']} "
-                f"C={m5['close']}"
-            )
-
-        m5 = {
-            "start": candle_start,
-            "open": price,
-            "high": price,
-            "low": price,
-            "close": price,
-        }
-
-        print(
-            f"[M5 NEW] {candle_start.isoformat()} "
-            f"O={price}"
-        )
-
-    else:
-        m5["high"] = max(m5["high"], price)
-        m5["low"] = min(m5["low"], price)
-        m5["close"] = price
+    print("[PING] sent")
 
 
 def on_open(ws):
-
-    print("=" * 60)
-    print("AI XAUUSD SIGNALS V1")
-    print("LIVE DATA ENGINE V1")
-    print("=" * 60)
     print("WEBSOCKET: CONNECTED")
-    print("SYMBOL: XAUUSD")
-    print("PRODUCT: COM")
+    print(f"SYMBOL: {SYMBOL}")
+    print(f"PRODUCT: {PRODUCT}")
 
     subscribe = {
-        "action": "subscribe",
+        "op": "subscribe",
         "product": PRODUCT,
         "symbols": [SYMBOL]
     }
 
-    ws.send(json.dumps(subscribe))
-
     print("[SUBSCRIBE] XAUUSD")
+    ws.send(json.dumps(subscribe))
 
 
 def on_message(ws, message):
-
     global last_tick_time
-    global last_price
-    global last_bid
-    global last_ask
 
     try:
         data = json.loads(message)
     except Exception:
-        print("[ERROR] Invalid JSON:", message)
+        print("[RAW INVALID]", message)
         return
 
     print("[RAW]", data)
 
-    # ACK / system messages
-    if data.get("type") in ("ack", "subscribed"):
-        print("[SYSTEM]", data)
-        return
+    frame = data.get("f")
 
-    # Tick
-    if data.get("type") == "tick":
+    # -----------------------------
+    # AUTH
+    # -----------------------------
+    if frame == "ack" and data.get("op") == "auth":
+        print("[AUTH] PASS")
 
-        try:
-            price = float(data["p"])
-            bid = float(data["b"])
-            ask = float(data["a"])
-            tick_timestamp = float(data["t"])
+    # -----------------------------
+    # SUBSCRIBE
+    # -----------------------------
+    elif frame == "ack" and data.get("op") == "subscribe":
+        print("[SUBSCRIBE] PASS")
+        print("[SUBSCRIBE] XAUUSD LIVE STREAM ACTIVE")
 
-        except Exception as e:
-            print("[ERROR] Invalid tick:", e)
+    # -----------------------------
+    # PONG
+    # -----------------------------
+    elif frame == "pong":
+        print("[PONG] PASS")
+
+    # -----------------------------
+    # TICK
+    # -----------------------------
+    elif frame == "tick":
+
+        symbol = data.get("s")
+        price = data.get("p")
+        bid = data.get("b")
+        ask = data.get("a")
+        timestamp_ms = data.get("t")
+
+        if symbol != SYMBOL:
             return
 
-        last_price = price
-        last_bid = bid
-        last_ask = ask
+        now_ms = int(time.time() * 1000)
 
-        last_tick_time = time.time()
+        if timestamp_ms is not None:
+            age_ms = now_ms - int(timestamp_ms)
+        else:
+            age_ms = -1
 
-        spread = ask - bid
+        if bid is not None and ask is not None:
+            spread = float(ask) - float(bid)
+        else:
+            spread = None
 
-        receive_time = utc_now().isoformat()
+        print("=" * 60)
+        print("[XAUUSD TICK]")
+        print(f"PRICE: {price}")
+        print(f"BID: {bid}")
+        print(f"ASK: {ask}")
 
+        if spread is not None:
+            print(f"SPREAD: {spread:.4f}")
+
+        print(f"TIMESTAMP: {timestamp_ms}")
+        print(f"AGE: {age_ms} ms")
+
+        # First tick is potentially the cached snapshot.
+        if last_tick_time is None:
+            print("[DATA] FIRST TICK RECEIVED")
+            print("[DATA] SNAPSHOT / INITIAL FRAME")
+
+        elif timestamp_ms is not None and timestamp_ms > last_tick_time:
+            print("[DATA] LIVE TICK: PASS")
+
+        else:
+            print("[DATA] STALE / REPLAYED TICK")
+
+        last_tick_time = timestamp_ms
+
+        print("=" * 60)
+
+    # -----------------------------
+    # ERROR
+    # -----------------------------
+    elif frame == "error":
         print(
-            f"[LIVE TICK] "
-            f"PRICE={price:.5f} "
-            f"BID={bid:.5f} "
-            f"ASK={ask:.5f} "
-            f"SPREAD={spread:.5f} "
-            f"PROVIDER_TS={tick_timestamp} "
-            f"RECEIVED={receive_time}"
+            f"[SIFTING ERROR] "
+            f"code={data.get('code')} "
+            f"message={data.get('message')}"
         )
 
-        update_m5(price, tick_timestamp)
+    else:
+        print("[INFO] Unhandled frame:", data)
 
 
 def on_error(ws, error):
@@ -180,75 +158,35 @@ def on_error(ws, error):
 
 
 def on_close(ws, close_status_code, close_msg):
-    print(
-        "[WEBSOCKET CLOSED]",
-        close_status_code,
-        close_msg
-    )
-
-
-def ping_loop(ws):
-
-    while True:
-
-        try:
-            time.sleep(PING_INTERVAL)
-
-            if ws.sock and ws.sock.connected:
-                ws.send(
-                    json.dumps(
-                        {
-                            "action": "ping"
-                        }
-                    )
-                )
-
-                print("[PING] sent")
-
-        except Exception as e:
-            print("[PING ERROR]", e)
-            break
+    print("[WEBSOCKET CLOSED]")
+    print("CODE:", close_status_code)
+    print("MESSAGE:", close_msg)
 
 
 def run():
 
-    if not API_KEY:
-        print("ERROR: SIFTING_API_KEY is missing.")
-        print("Add it in Railway Variables.")
-        return
-
-    print("Starting LIVE DATA ENGINE...")
-    print("API KEY: CONFIGURED")
-    print("API KEY VALUE: HIDDEN")
+    global last_ping_time
 
     while True:
 
+        print("[CONNECTING]", WS_URL.split("?")[0])
+
+        ws = websocket.WebSocketApp(
+            WS_URL,
+            on_open=on_open,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close
+        )
+
         try:
-
-            ws = websocket.WebSocketApp(
-                WS_URL,
-                on_open=on_open,
-                on_message=on_message,
-                on_error=on_error,
-                on_close=on_close
-            )
-
-            ping_thread = threading.Thread(
-                target=ping_loop,
-                args=(ws,),
-                daemon=True
-            )
-
-            ping_thread.start()
-
             ws.run_forever(
-                ping_interval=None,
-                ping_timeout=None
+                ping_interval=30,
+                ping_timeout=10
             )
 
         except Exception as e:
-
-            print("[CONNECTION ERROR]", e)
+            print("[RUN ERROR]", e)
 
         print("[RECONNECT] Waiting 5 seconds...")
         time.sleep(5)
