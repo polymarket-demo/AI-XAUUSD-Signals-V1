@@ -1,480 +1,258 @@
-import requests
+import os
+import json
 import time
-from datetime import datetime
+import threading
+from datetime import datetime, timezone
 
-# ============================================================
-# AI XAUUSD SIGNALS V1
-# LIVE XAUUSD -> M5 -> MOMENTUM -> SIGNAL
-# BUY / SELL -> ENTRY / SL / TP
-# ANALYSIS ONLY - NO ORDER EXECUTION
-# ============================================================
-
-API_URL = "https://xaus.com/api/v1/spot"
-
-# ============================================================
-# SETTINGS
-# ============================================================
-
-CANDLE_SECONDS = 300
-
-MIN_MOVE = 0.80
-
-STOP_DISTANCE = 1.20
-
-RISK_REWARD = 2.0
-
-SIGNAL_COOLDOWN = 300
-
-# ============================================================
-# DATA
-# ============================================================
-
-prices = []
-
-current_candle = None
-current_candle_start = None
-
-last_signal_time = None
+import websocket
 
 
-print("========================================")
-print("AI XAUUSD SIGNALS V1")
-print("========================================")
-print("LIVE XAU/USD")
-print("M5 MOMENTUM")
-print("BUY / SELL")
-print("ENTRY / SL / TP")
-print("MODE: ANALYSIS ONLY")
-print("========================================")
+API_KEY = os.getenv("SIFTING_API_KEY")
+
+WS_URL = f"wss://stream.sifting.io/ws/v1?key={API_KEY}"
+
+SYMBOL = "XAUUSD"
+PRODUCT = "com"
+
+PING_INTERVAL = 30
+STALE_SECONDS = 10
 
 
-# ============================================================
-# LIVE PRICE
-# ============================================================
+last_tick_time = None
+last_price = None
+last_bid = None
+last_ask = None
 
-def get_live_price():
-
-    response = requests.get(
-        API_URL,
-        params={
-            "fresh": int(time.time()),
-            "compact": "1"
-        },
-        timeout=10
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
-
-    price = float(
-        data["spot_usd_oz"]
-    )
-
-    price_time = data.get(
-        "price_as_of",
-        ""
-    )
-
-    status = data.get(
-        "data_state",
-        {}
-    ).get(
-        "status",
-        "unknown"
-    )
-
-    return price, price_time, status
+m5 = {
+    "start": None,
+    "open": None,
+    "high": None,
+    "low": None,
+    "close": None,
+}
 
 
-# ============================================================
-# SIGNAL
-# ============================================================
+def utc_now():
+    return datetime.now(timezone.utc)
 
-def generate_signal():
 
-    global last_signal_time
-
-    if len(prices) < 2:
+def print_status():
+    if last_tick_time is None:
         return
 
-    previous = prices[-2]
-    current = prices[-1]
+    age = time.time() - last_tick_time
 
-    move = (
-        current["close"]
-        - previous["close"]
-    )
-
-    print("")
-    print("========================================")
-    print("SIGNAL ENGINE")
-    print("========================================")
+    status = "FRESH" if age <= STALE_SECONDS else "STALE"
 
     print(
-        "PREVIOUS CLOSE:",
-        round(previous["close"], 4)
+        f"[DATA] "
+        f"PRICE={last_price} "
+        f"BID={last_bid} "
+        f"ASK={last_ask} "
+        f"AGE={age:.2f}s "
+        f"STATUS={status}"
     )
 
-    print(
-        "CURRENT CLOSE :",
-        round(current["close"], 4)
+
+def update_m5(price, tick_time):
+    global m5
+
+    dt = datetime.fromtimestamp(tick_time, timezone.utc)
+
+    minute = (dt.minute // 5) * 5
+
+    candle_start = dt.replace(
+        minute=minute,
+        second=0,
+        microsecond=0
     )
 
-    print(
-        "MOVE          :",
-        round(move, 4)
-    )
+    if m5["start"] != candle_start:
 
-    # ========================================================
-    # COOLDOWN
-    # ========================================================
-
-    now = time.time()
-
-    if (
-        last_signal_time is not None
-        and
-        now - last_signal_time
-        < SIGNAL_COOLDOWN
-    ):
-
-        remaining = int(
-            SIGNAL_COOLDOWN
-            - (
-                now
-                - last_signal_time
+        if m5["start"] is not None:
+            print(
+                f"[M5 CLOSED] "
+                f"{m5['start'].isoformat()} "
+                f"O={m5['open']} "
+                f"H={m5['high']} "
+                f"L={m5['low']} "
+                f"C={m5['close']}"
             )
-        )
+
+        m5 = {
+            "start": candle_start,
+            "open": price,
+            "high": price,
+            "low": price,
+            "close": price,
+        }
 
         print(
-            "SIGNAL: COOLDOWN",
-            remaining,
-            "sec"
+            f"[M5 NEW] {candle_start.isoformat()} "
+            f"O={price}"
         )
-
-        print("========================================")
-
-        return
-
-    # ========================================================
-    # BUY
-    # ========================================================
-
-    if move >= MIN_MOVE:
-
-        signal = "BUY"
-
-        entry = current["close"]
-
-        sl = (
-            entry
-            - STOP_DISTANCE
-        )
-
-        risk = (
-            entry
-            - sl
-        )
-
-        tp = (
-            entry
-            + risk * RISK_REWARD
-        )
-
-    # ========================================================
-    # SELL
-    # ========================================================
-
-    elif move <= -MIN_MOVE:
-
-        signal = "SELL"
-
-        entry = current["close"]
-
-        sl = (
-            entry
-            + STOP_DISTANCE
-        )
-
-        risk = (
-            sl
-            - entry
-        )
-
-        tp = (
-            entry
-            - risk * RISK_REWARD
-        )
-
-    # ========================================================
-    # NO SIGNAL
-    # ========================================================
 
     else:
-
-        print(
-            "SIGNAL: WAIT"
-        )
-
-        print(
-            "REASON: MOVE BELOW THRESHOLD"
-        )
-
-        print("========================================")
-
-        return
-
-    # ========================================================
-    # CONFIRMED SIGNAL
-    # ========================================================
-
-    last_signal_time = now
-
-    print("")
-    print("******** SIGNAL ********")
-
-    print(
-        "SIGNAL:",
-        signal
-    )
-
-    print(
-        "ENTRY:",
-        round(entry, 4)
-    )
-
-    print(
-        "SL:",
-        round(sl, 4)
-    )
-
-    print(
-        "TP:",
-        round(tp, 4)
-    )
-
-    print(
-        "RISK:",
-        round(risk, 4)
-    )
-
-    print(
-        "R/R: 1:",
-        RISK_REWARD
-    )
-
-    print(
-        "MOVE:",
-        round(move, 4)
-    )
-
-    print(
-        "MODE: ANALYSIS ONLY"
-    )
-
-    print("************************")
-    print("========================================")
+        m5["high"] = max(m5["high"], price)
+        m5["low"] = min(m5["low"], price)
+        m5["close"] = price
 
 
-# ============================================================
-# START CANDLE
-# ============================================================
+def on_open(ws):
 
-def start_candle(price, timestamp):
+    print("=" * 60)
+    print("AI XAUUSD SIGNALS V1")
+    print("LIVE DATA ENGINE V1")
+    print("=" * 60)
+    print("WEBSOCKET: CONNECTED")
+    print("SYMBOL: XAUUSD")
+    print("PRODUCT: COM")
 
-    global current_candle
-    global current_candle_start
-
-    minute = (
-        timestamp.minute
-    )
-
-    candle_minute = (
-        minute // 5
-    ) * 5
-
-    current_candle_start = (
-        timestamp.replace(
-            minute=candle_minute,
-            second=0,
-            microsecond=0
-        )
-    )
-
-    current_candle = {
-        "time": current_candle_start,
-        "open": price,
-        "high": price,
-        "low": price,
-        "close": price
+    subscribe = {
+        "action": "subscribe",
+        "product": PRODUCT,
+        "symbols": [SYMBOL]
     }
 
+    ws.send(json.dumps(subscribe))
 
-# ============================================================
-# UPDATE CANDLE
-# ============================================================
-
-def update_candle(price):
-
-    current_candle["high"] = max(
-        current_candle["high"],
-        price
-    )
-
-    current_candle["low"] = min(
-        current_candle["low"],
-        price
-    )
-
-    current_candle["close"] = price
+    print("[SUBSCRIBE] XAUUSD")
 
 
-# ============================================================
-# MAIN
-# ============================================================
+def on_message(ws, message):
 
-while True:
+    global last_tick_time
+    global last_price
+    global last_bid
+    global last_ask
 
     try:
+        data = json.loads(message)
+    except Exception:
+        print("[ERROR] Invalid JSON:", message)
+        return
 
-        price, price_time, status = (
-            get_live_price()
-        )
+    print("[RAW]", data)
 
-        if status != "fresh":
+    # ACK / system messages
+    if data.get("type") in ("ack", "subscribed"):
+        print("[SYSTEM]", data)
+        return
 
-            print(
-                "WARNING: DATA NOT FRESH",
-                status
-            )
+    # Tick
+    if data.get("type") == "tick":
 
-            time.sleep(30)
+        try:
+            price = float(data["p"])
+            bid = float(data["b"])
+            ask = float(data["a"])
+            tick_timestamp = float(data["t"])
 
-            continue
+        except Exception as e:
+            print("[ERROR] Invalid tick:", e)
+            return
 
-        timestamp = datetime.fromisoformat(
-            price_time.replace(
-                "Z",
-                "+00:00"
-            )
-        )
+        last_price = price
+        last_bid = bid
+        last_ask = ask
 
-        print("")
-        print("----------------------------------------")
+        last_tick_time = time.time()
 
-        print(
-            "LIVE PRICE:",
-            price
-        )
+        spread = ask - bid
 
-        print(
-            "TIME:",
-            price_time
-        )
-
-        print(
-            "STATUS:",
-            status
-        )
-
-        # ====================================================
-        # FIRST CANDLE
-        # ====================================================
-
-        if current_candle is None:
-
-            start_candle(
-                price,
-                timestamp
-            )
-
-            print(
-                "M5 CANDLE: STARTED"
-            )
-
-        else:
-
-            minute = timestamp.minute
-
-            candle_minute = (
-                minute // 5
-            ) * 5
-
-            # =================================================
-            # NEW CANDLE
-            # =================================================
-
-            if (
-                candle_minute
-                != current_candle_start.minute
-            ):
-
-                print("")
-                print("========================================")
-                print("M5 COMPLETED")
-                print("========================================")
-
-                print(
-                    "OPEN :",
-                    current_candle["open"]
-                )
-
-                print(
-                    "HIGH :",
-                    current_candle["high"]
-                )
-
-                print(
-                    "LOW  :",
-                    current_candle["low"]
-                )
-
-                print(
-                    "CLOSE:",
-                    current_candle["close"]
-                )
-
-                prices.append(
-                    current_candle.copy()
-                )
-
-                if len(prices) > 20:
-
-                    prices.pop(0)
-
-                generate_signal()
-
-                start_candle(
-                    price,
-                    timestamp
-                )
-
-                print(
-                    "NEW M5 CANDLE: STARTED"
-                )
-
-            else:
-
-                update_candle(
-                    price
-                )
-
-                print(
-                    "M5 CURRENT:",
-                    current_candle["open"],
-                    current_candle["high"],
-                    current_candle["low"],
-                    current_candle["close"]
-                )
-
-        print("----------------------------------------")
-
-    except Exception as e:
+        receive_time = utc_now().isoformat()
 
         print(
-            "ERROR:",
-            e
+            f"[LIVE TICK] "
+            f"PRICE={price:.5f} "
+            f"BID={bid:.5f} "
+            f"ASK={ask:.5f} "
+            f"SPREAD={spread:.5f} "
+            f"PROVIDER_TS={tick_timestamp} "
+            f"RECEIVED={receive_time}"
         )
 
-    time.sleep(30)
+        update_m5(price, tick_timestamp)
+
+
+def on_error(ws, error):
+    print("[WEBSOCKET ERROR]", error)
+
+
+def on_close(ws, close_status_code, close_msg):
+    print(
+        "[WEBSOCKET CLOSED]",
+        close_status_code,
+        close_msg
+    )
+
+
+def ping_loop(ws):
+
+    while True:
+
+        try:
+            time.sleep(PING_INTERVAL)
+
+            if ws.sock and ws.sock.connected:
+                ws.send(
+                    json.dumps(
+                        {
+                            "action": "ping"
+                        }
+                    )
+                )
+
+                print("[PING] sent")
+
+        except Exception as e:
+            print("[PING ERROR]", e)
+            break
+
+
+def run():
+
+    if not API_KEY:
+        print("ERROR: SIFTING_API_KEY is missing.")
+        print("Add it in Railway Variables.")
+        return
+
+    print("Starting LIVE DATA ENGINE...")
+    print("API KEY: CONFIGURED")
+    print("API KEY VALUE: HIDDEN")
+
+    while True:
+
+        try:
+
+            ws = websocket.WebSocketApp(
+                WS_URL,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close
+            )
+
+            ping_thread = threading.Thread(
+                target=ping_loop,
+                args=(ws,),
+                daemon=True
+            )
+
+            ping_thread.start()
+
+            ws.run_forever(
+                ping_interval=None,
+                ping_timeout=None
+            )
+
+        except Exception as e:
+
+            print("[CONNECTION ERROR]", e)
+
+        print("[RECONNECT] Waiting 5 seconds...")
+        time.sleep(5)
+
+
+if __name__ == "__main__":
+    run()
