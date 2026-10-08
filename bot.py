@@ -7,8 +7,9 @@ import websocket
 
 
 # ============================================================
-# AI XAUUSD SIGNALS V1.2
+# AI XAUUSD SIGNALS V1.3
 # LIVE DATA ENGINE + M5 BUILDER
+# TICK FILTER / DE-DUPLICATION
 # ============================================================
 
 API_KEY = os.getenv("SIFTING_API_KEY")
@@ -25,13 +26,18 @@ PRODUCT = "com"
 
 RECONNECT_WAIT = 15
 
-# ------------------------------------------------------------
+
+# ============================================================
 # M5 STATE
-# ------------------------------------------------------------
+# ============================================================
 
 current_bucket = None
 current_bar = None
+
 last_tick_ms = 0
+accepted_ticks = 0
+duplicate_ticks = 0
+out_of_order_ticks = 0
 
 
 # ============================================================
@@ -39,6 +45,7 @@ last_tick_ms = 0
 # ============================================================
 
 def get_m5_bucket(dt):
+
     minute = (dt.minute // 5) * 5
 
     return dt.replace(
@@ -48,9 +55,10 @@ def get_m5_bucket(dt):
     )
 
 
-def print_bar(bar, status="M5 CLOSED"):
+def print_bar(bar):
+
     print("----------------------------------------")
-    print(f"[{status}] PASS")
+    print("[M5 CLOSED] PASS")
     print(f"TIME: {bar['time']}")
     print(f"OPEN: {bar['open']}")
     print(f"HIGH: {bar['high']}")
@@ -60,28 +68,74 @@ def print_bar(bar, status="M5 CLOSED"):
     print("----------------------------------------")
 
 
+# ============================================================
+# CLEAN TICK FILTER
+# ============================================================
+
+def filter_tick(tick_ms):
+
+    global last_tick_ms
+    global accepted_ticks
+    global duplicate_ticks
+    global out_of_order_ticks
+
+    # --------------------------------------------------------
+    # DUPLICATE
+    # --------------------------------------------------------
+
+    if tick_ms == last_tick_ms:
+
+        duplicate_ticks += 1
+
+        print(
+            f"[TICK DUPLICATE IGNORED] "
+            f"TS={tick_ms} "
+            f"TOTAL_DUPLICATES={duplicate_ticks}"
+        )
+
+        return False
+
+    # --------------------------------------------------------
+    # OUT OF ORDER
+    # --------------------------------------------------------
+
+    if tick_ms < last_tick_ms:
+
+        out_of_order_ticks += 1
+
+        print(
+            f"[TICK OUT OF ORDER IGNORED] "
+            f"TS={tick_ms} "
+            f"LAST={last_tick_ms} "
+            f"TOTAL_OUT_OF_ORDER={out_of_order_ticks}"
+        )
+
+        return False
+
+    # --------------------------------------------------------
+    # ACCEPT
+    # --------------------------------------------------------
+
+    last_tick_ms = tick_ms
+    accepted_ticks += 1
+
+    print(
+        f"[TICK ACCEPTED] "
+        f"TS={tick_ms} "
+        f"TOTAL_ACCEPTED={accepted_ticks}"
+    )
+
+    return True
+
+
+# ============================================================
+# M5 PROCESSOR
+# ============================================================
+
 def process_tick(price, tick_ms):
 
     global current_bucket
     global current_bar
-    global last_tick_ms
-
-    # --------------------------------------------------------
-    # Reject old/replayed ticks
-    # --------------------------------------------------------
-
-    if tick_ms <= last_tick_ms:
-        print(
-            f"[M5 WARNING] OLD TICK IGNORED "
-            f"TICK_MS={tick_ms} LAST={last_tick_ms}"
-        )
-        return
-
-    last_tick_ms = tick_ms
-
-    # --------------------------------------------------------
-    # Convert timestamp
-    # --------------------------------------------------------
 
     tick_dt = datetime.fromtimestamp(
         tick_ms / 1000,
@@ -98,7 +152,7 @@ def process_tick(price, tick_ms):
     )
 
     # --------------------------------------------------------
-    # FIRST BAR
+    # FIRST M5
     # --------------------------------------------------------
 
     if current_bucket is None:
@@ -138,7 +192,7 @@ def process_tick(price, tick_ms):
         return
 
     # --------------------------------------------------------
-    # NEW M5 BUCKET
+    # NEW M5
     # --------------------------------------------------------
 
     if bucket > current_bucket:
@@ -146,7 +200,7 @@ def process_tick(price, tick_ms):
         print("[M5 CHANGE] NEW 5-MINUTE BUCKET DETECTED")
 
         # Close previous candle
-        print_bar(current_bar, "M5 CLOSED")
+        print_bar(current_bar)
 
         # Start new candle
         current_bucket = bucket
@@ -167,21 +221,17 @@ def process_tick(price, tick_ms):
         return
 
     # --------------------------------------------------------
-    # BUCKET MOVED BACKWARDS
+    # BACKWARD BUCKET
     # --------------------------------------------------------
 
-    if bucket < current_bucket:
-
-        print(
-            "[M5 WARNING] "
-            "BUCKET MOVED BACKWARDS - IGNORED"
-        )
-
-        return
+    print(
+        "[M5 WARNING] "
+        "BUCKET MOVED BACKWARDS - IGNORED"
+    )
 
 
 # ============================================================
-# WEBSOCKET CALLBACKS
+# WEBSOCKET
 # ============================================================
 
 def on_open(ws):
@@ -215,13 +265,12 @@ def on_message(ws, message):
         if data.get("f") == "ack":
 
             if data.get("op") == "auth":
-
                 print("[AUTH] PASS")
 
             return
 
         # ----------------------------------------------------
-        # ERROR
+        # SERVER ERROR
         # ----------------------------------------------------
 
         if data.get("f") == "error":
@@ -235,42 +284,66 @@ def on_message(ws, message):
             return
 
         # ----------------------------------------------------
-        # TICK
+        # IGNORE NON-TICK MESSAGES
         # ----------------------------------------------------
 
-        if "p" not in data:
+        if "p" not in data or "t" not in data:
 
             return
 
         price = float(data["p"])
-
         tick_ms = int(data["t"])
 
         bid = data.get("b")
         ask = data.get("a")
 
         now_ms = int(time.time() * 1000)
-
         age = now_ms - tick_ms
 
-        print(
-            f"[TICK] "
-            f"PRICE={price:.2f} "
-            f"BID={float(bid):.2f} "
-            f"ASK={float(ask):.2f} "
-            f"AGE={age}ms"
-            if bid is not None and ask is not None
-            else
-            f"[TICK] PRICE={price:.2f} AGE={age}ms"
-        )
+        # ----------------------------------------------------
+        # BASIC TICK INFORMATION
+        # ----------------------------------------------------
 
         if bid is not None and ask is not None:
 
-            spread = float(ask) - float(bid)
+            bid_value = float(bid)
+            ask_value = float(ask)
+
+            spread = ask_value - bid_value
+
+            print(
+                f"[TICK RAW] "
+                f"PRICE={price:.2f} "
+                f"BID={bid_value:.2f} "
+                f"ASK={ask_value:.2f} "
+                f"AGE={age}ms "
+                f"TS={tick_ms}"
+            )
 
             print(
                 f"[SPREAD] {spread:.4f}"
             )
+
+        else:
+
+            print(
+                f"[TICK RAW] "
+                f"PRICE={price:.2f} "
+                f"AGE={age}ms "
+                f"TS={tick_ms}"
+            )
+
+        # ----------------------------------------------------
+        # FILTER
+        # ----------------------------------------------------
+
+        if not filter_tick(tick_ms):
+
+            return
+
+        # ----------------------------------------------------
+        # ACCEPTED DATA
+        # ----------------------------------------------------
 
         print("[DATA] LIVE TICK: PASS")
 
@@ -286,7 +359,8 @@ def on_message(ws, message):
     except Exception as e:
 
         print(
-            f"[MESSAGE ERROR] {type(e).__name__}: {e}"
+            f"[MESSAGE ERROR] "
+            f"{type(e).__name__}: {e}"
         )
 
 
@@ -310,14 +384,15 @@ def on_close(ws, close_status_code, close_msg):
 
 
 # ============================================================
-# MAIN CONNECTION LOOP
+# CONNECTION LOOP
 # ============================================================
 
 def run():
 
     print("========================================")
-    print("AI XAUUSD SIGNALS V1.2")
+    print("AI XAUUSD SIGNALS V1.3")
     print("LIVE DATA ENGINE + M5 BUILDER")
+    print("TICK FILTER / DE-DUPLICATION")
     print("========================================")
     print("API KEY: CONFIGURED")
     print(f"SYMBOL: {SYMBOL}")
@@ -355,7 +430,6 @@ def run():
 
         finally:
 
-            # Explicitly release this connection
             if ws is not None:
 
                 try:
