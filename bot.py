@@ -1,22 +1,21 @@
 import os
 import json
 import time
+import threading
 from datetime import datetime, timezone
 
 import websocket
 
 
-# ============================================================
-# AI XAUUSD SIGNALS V1.3
-# LIVE DATA ENGINE + M5 BUILDER
-# TICK FILTER / DE-DUPLICATION
-# ============================================================
+# =========================================================
+# AI XAUUSD SIGNALS V1
+# M5 BUILDER V1.4
+# =========================================================
 
 API_KEY = os.getenv("SIFTING_API_KEY")
 
 if not API_KEY:
-    print("ERROR: SIFTING_API_KEY NOT CONFIGURED")
-    raise SystemExit(1)
+    raise RuntimeError("SIFTING_API_KEY non trovata nelle Railway Variables")
 
 
 WS_URL = f"wss://stream.sifting.io/ws/v1?key={API_KEY}"
@@ -25,26 +24,44 @@ SYMBOL = "XAUUSD"
 PRODUCT = "com"
 
 RECONNECT_WAIT = 15
+PING_INTERVAL = 30
+PING_TIMEOUT = 10
 
 
-# ============================================================
-# M5 STATE
-# ============================================================
+# =========================================================
+# STATO GLOBALE
+# =========================================================
+
+state_lock = threading.Lock()
 
 current_bucket = None
 current_bar = None
 
-last_tick_ms = 0
+last_tick_ms = None
+last_closed_bucket = None
+
 accepted_ticks = 0
-duplicate_ticks = 0
-out_of_order_ticks = 0
+ignored_duplicates = 0
+ignored_out_of_order = 0
 
 
-# ============================================================
-# M5 FUNCTIONS
-# ============================================================
+# =========================================================
+# UTILITY
+# =========================================================
 
-def get_m5_bucket(dt):
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def bucket_from_timestamp_ms(timestamp_ms):
+    """
+    Trasforma il timestamp del tick nel relativo bucket M5.
+    """
+
+    dt = datetime.fromtimestamp(
+        timestamp_ms / 1000.0,
+        tz=timezone.utc
+    )
 
     minute = (dt.minute // 5) * 5
 
@@ -55,191 +72,304 @@ def get_m5_bucket(dt):
     )
 
 
-def print_bar(bar):
+def format_bucket(bucket):
+    if bucket is None:
+        return "NONE"
 
-    print("----------------------------------------")
+    return bucket.strftime("%Y-%m-%d %H:%M")
+
+
+# =========================================================
+# LOG STATO
+# =========================================================
+
+def print_state(prefix="[M5 STATE]"):
+
+    with state_lock:
+
+        if current_bar is None:
+            print(
+                f"{prefix} "
+                f"BUCKET={format_bucket(current_bucket)} "
+                f"BAR=NONE"
+            )
+            return
+
+        print(
+            f"{prefix} "
+            f"BUCKET={format_bucket(current_bucket)} "
+            f"OPEN={current_bar['open']:.3f} "
+            f"HIGH={current_bar['high']:.3f} "
+            f"LOW={current_bar['low']:.3f} "
+            f"CLOSE={current_bar['close']:.3f} "
+            f"TICKS={current_bar['ticks']}"
+        )
+
+
+# =========================================================
+# CHIUSURA M5
+# =========================================================
+
+def close_current_bar(reason="NEXT_BUCKET"):
+
+    global current_bucket
+    global current_bar
+    global last_closed_bucket
+
+    if current_bucket is None or current_bar is None:
+        return
+
+    closed_bucket = current_bucket
+    bar = current_bar.copy()
+
+    print("")
+    print("========================================")
     print("[M5 CLOSED] PASS")
-    print(f"TIME: {bar['time']}")
-    print(f"OPEN: {bar['open']}")
-    print(f"HIGH: {bar['high']}")
-    print(f"LOW: {bar['low']}")
-    print(f"CLOSE: {bar['close']}")
-    print(f"TICKS: {bar['ticks']}")
-    print("----------------------------------------")
+    print(f"REASON: {reason}")
+    print(f"BUCKET: {format_bucket(closed_bucket)}")
+    print(f"OPEN:   {bar['open']:.3f}")
+    print(f"HIGH:   {bar['high']:.3f}")
+    print(f"LOW:    {bar['low']:.3f}")
+    print(f"CLOSE:  {bar['close']:.3f}")
+    print(f"TICKS:  {bar['ticks']}")
+    print("========================================")
+    print("")
+
+    last_closed_bucket = closed_bucket
+
+    current_bucket = None
+    current_bar = None
 
 
-# ============================================================
-# CLEAN TICK FILTER
-# ============================================================
+# =========================================================
+# FILTRO TICK
+# =========================================================
 
-def filter_tick(tick_ms):
+def filter_tick(timestamp_ms):
 
     global last_tick_ms
-    global accepted_ticks
-    global duplicate_ticks
-    global out_of_order_ticks
+    global ignored_duplicates
+    global ignored_out_of_order
 
-    # --------------------------------------------------------
-    # DUPLICATE
-    # --------------------------------------------------------
+    if last_tick_ms is None:
 
-    if tick_ms == last_tick_ms:
+        last_tick_ms = timestamp_ms
 
-        duplicate_ticks += 1
+        return True
+
+    if timestamp_ms == last_tick_ms:
+
+        ignored_duplicates += 1
 
         print(
             f"[TICK DUPLICATE IGNORED] "
-            f"TS={tick_ms} "
-            f"TOTAL_DUPLICATES={duplicate_ticks}"
+            f"t={timestamp_ms}"
         )
 
         return False
 
-    # --------------------------------------------------------
-    # OUT OF ORDER
-    # --------------------------------------------------------
+    if timestamp_ms < last_tick_ms:
 
-    if tick_ms < last_tick_ms:
-
-        out_of_order_ticks += 1
+        ignored_out_of_order += 1
 
         print(
             f"[TICK OUT OF ORDER IGNORED] "
-            f"TS={tick_ms} "
-            f"LAST={last_tick_ms} "
-            f"TOTAL_OUT_OF_ORDER={out_of_order_ticks}"
+            f"t={timestamp_ms} "
+            f"last={last_tick_ms}"
         )
 
         return False
 
-    # --------------------------------------------------------
-    # ACCEPT
-    # --------------------------------------------------------
-
-    last_tick_ms = tick_ms
-    accepted_ticks += 1
-
-    print(
-        f"[TICK ACCEPTED] "
-        f"TS={tick_ms} "
-        f"TOTAL_ACCEPTED={accepted_ticks}"
-    )
+    last_tick_ms = timestamp_ms
 
     return True
 
 
-# ============================================================
-# M5 PROCESSOR
-# ============================================================
+# =========================================================
+# PROCESSAMENTO TICK
+# =========================================================
 
-def process_tick(price, tick_ms):
+def process_tick(msg):
 
     global current_bucket
     global current_bar
+    global accepted_ticks
+
+    try:
+
+        timestamp_ms = int(msg["t"])
+        price = float(msg["p"])
+
+    except (KeyError, TypeError, ValueError):
+
+        print("[TICK ERROR] formato tick non valido")
+
+        return
+
+
+    # -----------------------------------------------------
+    # FILTRO
+    # -----------------------------------------------------
+
+    if not filter_tick(timestamp_ms):
+        return
+
+
+    accepted_ticks += 1
+
 
     tick_dt = datetime.fromtimestamp(
-        tick_ms / 1000,
+        timestamp_ms / 1000.0,
         tz=timezone.utc
     )
 
-    bucket = get_m5_bucket(tick_dt)
+    bucket = bucket_from_timestamp_ms(timestamp_ms)
+
 
     print(
-        f"[M5 DEBUG] "
-        f"TICK_UTC={tick_dt.strftime('%Y-%m-%d %H:%M:%S')} "
-        f"BUCKET={bucket.strftime('%Y-%m-%d %H:%M:%S')} "
-        f"CURRENT={current_bucket.strftime('%Y-%m-%d %H:%M:%S') if current_bucket else 'NONE'}"
-    )
-
-    # --------------------------------------------------------
-    # FIRST M5
-    # --------------------------------------------------------
-
-    if current_bucket is None:
-
-        current_bucket = bucket
-
-        current_bar = {
-            "time": bucket.strftime("%Y-%m-%d %H:%M:%S UTC"),
-            "open": price,
-            "high": price,
-            "low": price,
-            "close": price,
-            "ticks": 1
-        }
-
-        print("[M5 START] PASS")
-        print(f"TIME: {current_bar['time']}")
-        print(f"OPEN: {price}")
-
-        return
-
-    # --------------------------------------------------------
-    # SAME M5
-    # --------------------------------------------------------
-
-    if bucket == current_bucket:
-
-        if price > current_bar["high"]:
-            current_bar["high"] = price
-
-        if price < current_bar["low"]:
-            current_bar["low"] = price
-
-        current_bar["close"] = price
-        current_bar["ticks"] += 1
-
-        return
-
-    # --------------------------------------------------------
-    # NEW M5
-    # --------------------------------------------------------
-
-    if bucket > current_bucket:
-
-        print("[M5 CHANGE] NEW 5-MINUTE BUCKET DETECTED")
-
-        # Close previous candle
-        print_bar(current_bar)
-
-        # Start new candle
-        current_bucket = bucket
-
-        current_bar = {
-            "time": bucket.strftime("%Y-%m-%d %H:%M:%S UTC"),
-            "open": price,
-            "high": price,
-            "low": price,
-            "close": price,
-            "ticks": 1
-        }
-
-        print("[M5 START] PASS")
-        print(f"TIME: {current_bar['time']}")
-        print(f"OPEN: {price}")
-
-        return
-
-    # --------------------------------------------------------
-    # BACKWARD BUCKET
-    # --------------------------------------------------------
-
-    print(
-        "[M5 WARNING] "
-        "BUCKET MOVED BACKWARDS - IGNORED"
+        f"[TICK ACCETTATO] "
+        f"UTC={tick_dt.strftime('%Y-%m-%d %H:%M:%S')} "
+        f"PRICE={price:.3f} "
+        f"BUCKET={format_bucket(bucket)}"
     )
 
 
-# ============================================================
+    with state_lock:
+
+        # -------------------------------------------------
+        # PRIMO TICK
+        # -------------------------------------------------
+
+        if current_bucket is None:
+
+            # Se il tick appartiene a una candela già chiusa,
+            # lo ignoriamo.
+            if (
+                last_closed_bucket is not None
+                and bucket <= last_closed_bucket
+            ):
+
+                print(
+                    f"[M5 OLD TICK IGNORED] "
+                    f"BUCKET={format_bucket(bucket)} "
+                    f"LAST_CLOSED={format_bucket(last_closed_bucket)}"
+                )
+
+                return
+
+
+            current_bucket = bucket
+
+            current_bar = {
+                "open": price,
+                "high": price,
+                "low": price,
+                "close": price,
+                "ticks": 1
+            }
+
+            print("")
+            print("[M5 START] PASS")
+            print(f"BUCKET: {format_bucket(bucket)}")
+            print(f"OPEN:   {price:.3f}")
+            print("")
+
+            return
+
+
+        # -------------------------------------------------
+        # STESSO BUCKET
+        # -------------------------------------------------
+
+        if bucket == current_bucket:
+
+            current_bar["high"] = max(
+                current_bar["high"],
+                price
+            )
+
+            current_bar["low"] = min(
+                current_bar["low"],
+                price
+            )
+
+            current_bar["close"] = price
+
+            current_bar["ticks"] += 1
+
+            return
+
+
+        # -------------------------------------------------
+        # BUCKET SUCCESSIVO
+        # -------------------------------------------------
+
+        if bucket > current_bucket:
+
+            old_bucket = current_bucket
+            new_bucket = bucket
+
+            print("")
+            print("[M5 TRANSITION]")
+            print(
+                f"OLD BUCKET: {format_bucket(old_bucket)}"
+            )
+            print(
+                f"NEW BUCKET: {format_bucket(new_bucket)}"
+            )
+            print("")
+
+            # Chiude la candela precedente
+            close_current_bar(
+                reason="NEXT_BUCKET"
+            )
+
+            # Nuova candela
+            current_bucket = bucket
+
+            current_bar = {
+                "open": price,
+                "high": price,
+                "low": price,
+                "close": price,
+                "ticks": 1
+            }
+
+            print("")
+            print("[M5 START] PASS")
+            print(f"BUCKET: {format_bucket(bucket)}")
+            print(f"OPEN:   {price:.3f}")
+            print("")
+
+            return
+
+
+        # -------------------------------------------------
+        # TICK DI UN BUCKET VECCHIO
+        # -------------------------------------------------
+
+        if bucket < current_bucket:
+
+            print(
+                f"[M5 OLD BUCKET IGNORED] "
+                f"TICK={format_bucket(bucket)} "
+                f"CURRENT={format_bucket(current_bucket)}"
+            )
+
+            return
+
+
+# =========================================================
 # WEBSOCKET
-# ============================================================
+# =========================================================
 
 def on_open(ws):
 
-    print("----------------------------------------")
-    print("WEBSOCKET: CONNECTED")
-    print(f"SYMBOL: {SYMBOL}")
-    print(f"PRODUCT: {PRODUCT}")
+    print("")
+    print("========================================")
+    print("[WEBSOCKET OPEN]")
+    print("========================================")
+    print("")
 
     subscribe_message = {
         "op": "subscribe",
@@ -249,119 +379,171 @@ def on_open(ws):
 
     ws.send(json.dumps(subscribe_message))
 
-    print("[SUBSCRIBE] XAUUSD")
+    print("[SUBSCRIBE] XAUUSD SENT")
 
 
 def on_message(ws, message):
 
+    global ignored_duplicates
+    global ignored_out_of_order
+
     try:
 
-        data = json.loads(message)
+        msg = json.loads(message)
 
-        # ----------------------------------------------------
-        # AUTH
-        # ----------------------------------------------------
+    except json.JSONDecodeError:
 
-        if data.get("f") == "ack":
+        print("[JSON ERROR]")
+        return
 
-            if data.get("op") == "auth":
-                print("[AUTH] PASS")
 
-            return
+    frame_type = msg.get("f")
 
-        # ----------------------------------------------------
-        # SERVER ERROR
-        # ----------------------------------------------------
 
-        if data.get("f") == "error":
+    # =====================================================
+    # AUTH
+    # =====================================================
+
+    if frame_type == "ack":
+
+        op = msg.get("op")
+
+        if op == "auth":
 
             print(
-                f"[ERROR] "
-                f"CODE={data.get('code')} "
-                f"MESSAGE={data.get('message')}"
+                f"[AUTH PASS] "
+                f"TIER={msg.get('tier')} "
+                f"MAX_CONN={msg.get('max_conn')} "
+                f"ACTIVE_CONN={msg.get('active_conn')}"
             )
 
+        elif op == "subscribe":
+
+            print(
+                "[SUBSCRIBE PASS] "
+                f"{msg.get('symbols')}"
+            )
+
+        return
+
+
+    # =====================================================
+    # PONG
+    # =====================================================
+
+    if frame_type == "pong":
+
+        print("[PING/PONG] PASS")
+
+        return
+
+
+    # =====================================================
+    # ERROR
+    # =====================================================
+
+    if frame_type == "error":
+
+        print(
+            f"[SIFTING ERROR] "
+            f"CODE={msg.get('code')} "
+            f"MESSAGE={msg.get('message')}"
+        )
+
+        return
+
+
+    # =====================================================
+    # TICK
+    # =====================================================
+
+    if frame_type == "tick":
+
+        symbol = msg.get("s")
+
+        if symbol != SYMBOL:
             return
 
-        # ----------------------------------------------------
-        # IGNORE NON-TICK MESSAGES
-        # ----------------------------------------------------
 
-        if "p" not in data or "t" not in data:
+        try:
+
+            timestamp_ms = int(msg["t"])
+            price = float(msg["p"])
+
+        except (KeyError, TypeError, ValueError):
+
+            print("[TICK ERROR] dati mancanti")
 
             return
 
-        price = float(data["p"])
-        tick_ms = int(data["t"])
-
-        bid = data.get("b")
-        ask = data.get("a")
 
         now_ms = int(time.time() * 1000)
-        age = now_ms - tick_ms
 
-        # ----------------------------------------------------
-        # BASIC TICK INFORMATION
-        # ----------------------------------------------------
+        age_ms = now_ms - timestamp_ms
 
-        if bid is not None and ask is not None:
 
-            bid_value = float(bid)
-            ask_value = float(ask)
+        bid = msg.get("b")
+        ask = msg.get("a")
 
-            spread = ask_value - bid_value
+
+        spread = None
+
+        try:
+
+            if bid is not None and ask is not None:
+
+                spread = float(ask) - float(bid)
+
+        except (TypeError, ValueError):
+
+            spread = None
+
+
+        if spread is not None:
 
             print(
-                f"[TICK RAW] "
-                f"PRICE={price:.2f} "
-                f"BID={bid_value:.2f} "
-                f"ASK={ask_value:.2f} "
-                f"AGE={age}ms "
-                f"TS={tick_ms}"
-            )
-
-            print(
-                f"[SPREAD] {spread:.4f}"
+                f"[DATA] LIVE TICK: PASS "
+                f"PRICE={price:.3f} "
+                f"AGE={age_ms}ms "
+                f"SPREAD={spread:.3f}"
             )
 
         else:
 
             print(
-                f"[TICK RAW] "
-                f"PRICE={price:.2f} "
-                f"AGE={age}ms "
-                f"TS={tick_ms}"
+                f"[DATA] LIVE TICK: PASS "
+                f"PRICE={price:.3f} "
+                f"AGE={age_ms}ms"
             )
 
-        # ----------------------------------------------------
-        # FILTER
-        # ----------------------------------------------------
 
-        if not filter_tick(tick_ms):
+        # -------------------------------------------------
+        # BLOCCO STALE
+        # -------------------------------------------------
+
+        if age_ms > 5000:
+
+            print(
+                f"[STALE TICK IGNORED] "
+                f"AGE={age_ms}ms"
+            )
 
             return
 
-        # ----------------------------------------------------
-        # ACCEPTED DATA
-        # ----------------------------------------------------
 
-        print("[DATA] LIVE TICK: PASS")
+        process_tick(msg)
 
-        # ----------------------------------------------------
-        # M5
-        # ----------------------------------------------------
+        return
 
-        process_tick(
-            price,
-            tick_ms
-        )
 
-    except Exception as e:
+    # =====================================================
+    # FRAME SCONOSCIUTO
+    # =====================================================
 
-        print(
-            f"[MESSAGE ERROR] "
-            f"{type(e).__name__}: {e}"
-        )
+    print(
+        f"[FRAME IGNORED] "
+        f"{msg}"
+    )
 
 
 def on_error(ws, error):
@@ -373,32 +555,24 @@ def on_error(ws, error):
 
 def on_close(ws, close_status_code, close_msg):
 
-    print("----------------------------------------")
-    print("[WEBSOCKET CLOSED]")
-    print(f"CODE: {close_status_code}")
-    print(f"MESSAGE: {close_msg}")
+    print("")
+    print("========================================")
     print(
-        f"[RECONNECT] Waiting {RECONNECT_WAIT} seconds..."
+        f"[WEBSOCKET CLOSED] "
+        f"CODE={close_status_code} "
+        f"MESSAGE={close_msg}"
     )
-    print("----------------------------------------")
+    print("========================================")
+    print("")
 
 
-# ============================================================
-# CONNECTION LOOP
-# ============================================================
+# =========================================================
+# MAIN
+# =========================================================
 
 def run():
 
-    print("========================================")
-    print("AI XAUUSD SIGNALS V1.3")
-    print("LIVE DATA ENGINE + M5 BUILDER")
-    print("TICK FILTER / DE-DUPLICATION")
-    print("========================================")
-    print("API KEY: CONFIGURED")
-    print(f"SYMBOL: {SYMBOL}")
-    print(f"PRODUCT: {PRODUCT}")
-    print("MODE: LIVE DATA ONLY")
-    print("========================================")
+    attempt = 0
 
     while True:
 
@@ -406,7 +580,15 @@ def run():
 
         try:
 
-            print("[CONNECTING]")
+            print("")
+            print("========================================")
+            print("AI XAUUSD SIGNALS V1")
+            print("M5 BUILDER V1.4")
+            print("LIVE XAUUSD")
+            print("========================================")
+            print(
+                f"[CONNECTING] attempt={attempt + 1}"
+            )
 
             ws = websocket.WebSocketApp(
                 WS_URL,
@@ -417,15 +599,14 @@ def run():
             )
 
             ws.run_forever(
-                ping_interval=30,
-                ping_timeout=10
+                ping_interval=PING_INTERVAL,
+                ping_timeout=PING_TIMEOUT
             )
 
         except Exception as e:
 
             print(
-                f"[CONNECTION EXCEPTION] "
-                f"{type(e).__name__}: {e}"
+                f"[RUN ERROR] {type(e).__name__}: {e}"
             )
 
         finally:
@@ -434,17 +615,20 @@ def run():
 
                 try:
                     ws.close()
+
                 except Exception:
                     pass
 
-            ws = None
+
+        attempt += 1
+
+        print(
+            f"[RECONNECT] waiting "
+            f"{RECONNECT_WAIT}s"
+        )
 
         time.sleep(RECONNECT_WAIT)
 
-
-# ============================================================
-# START
-# ============================================================
 
 if __name__ == "__main__":
     run()
