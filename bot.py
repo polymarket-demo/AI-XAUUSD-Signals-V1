@@ -1,66 +1,65 @@
-import os
-import json
 import time
-import threading
-from datetime import datetime, timezone, timedelta
-
-import websocket
-
+import requests
+from datetime import datetime, timezone
 
 # =========================================================
 # AI XAUUSD SIGNALS V1
-# M5 BUILDER
+# STEP 4
+# LIVE FEED -> M5 -> CLOSED CANDLE -> TREND ENGINE
+# ANALYSIS ONLY
 # =========================================================
 
-API_KEY = os.getenv("SIFTING_API_KEY")
+API_URL = "https://xaus.com/api/v1/spot"
 
-if not API_KEY:
-    raise RuntimeError(
-        "SIFTING_API_KEY non trovata nelle Railway Variables"
-    )
+POLL_SECONDS = 1.0
 
+MAX_CANDLES = 50
+MIN_CANDLES_FOR_TREND = 20
 
-WS_URL = f"wss://stream.sifting.io/ws/v1?key={API_KEY}"
+EMA_FAST = 20
+EMA_SLOW = 50
 
-SYMBOL = "XAUUSD"
-PRODUCT = "com"
-
-RECONNECT_WAIT = 15
-PING_INTERVAL = 30
-PING_TIMEOUT = 10
-
-# Controllo orologio M5 indipendente dai tick
-BOUNDARY_CHECK_INTERVAL = 0.20
-
+RR = 2.0
 
 # =========================================================
-# STATO
+# STORAGE
 # =========================================================
 
-state_lock = threading.Lock()
+candles = []
 
-current_bucket = None
-current_bar = None
-
-last_tick_ms = None
-last_closed_bucket = None
-
-accepted_ticks = 0
-ignored_duplicates = 0
-ignored_out_of_order = 0
+current_candle = None
 
 
 # =========================================================
-# TIME / BUCKET
+# TIME
 # =========================================================
 
-def bucket_from_timestamp_ms(timestamp_ms):
+def utc_now():
+    return datetime.now(timezone.utc)
 
-    dt = datetime.fromtimestamp(
-        timestamp_ms / 1000.0,
-        tz=timezone.utc
-    )
 
+def parse_timestamp(value):
+    if not value:
+        return utc_now()
+
+    try:
+        value = value.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(value)
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
+        return dt.astimezone(timezone.utc)
+
+    except Exception:
+        return utc_now()
+
+
+# =========================================================
+# M5 BUCKET
+# =========================================================
+
+def get_m5_bucket(dt):
     minute = (dt.minute // 5) * 5
 
     return dt.replace(
@@ -70,767 +69,528 @@ def bucket_from_timestamp_ms(timestamp_ms):
     )
 
 
-def current_wall_clock_bucket():
+# =========================================================
+# LIVE DATA
+# =========================================================
 
-    now = datetime.now(timezone.utc)
+def get_live_tick():
 
-    minute = (now.minute // 5) * 5
+    try:
+        response = requests.get(
+            API_URL,
+            timeout=10
+        )
 
-    return now.replace(
-        minute=minute,
-        second=0,
-        microsecond=0
-    )
+        response.raise_for_status()
 
+        data = response.json()
 
-def next_boundary_after(bucket):
+        # -------------------------------------------------
+        # DATA STATE
+        # -------------------------------------------------
 
-    return bucket + timedelta(minutes=5)
+        data_state = data.get("data_state", {})
 
+        status = data_state.get(
+            "status",
+            data.get("status", "")
+        )
 
-def format_bucket(bucket):
+        # -------------------------------------------------
+        # PRICE
+        # -------------------------------------------------
 
-    if bucket is None:
-        return "NONE"
+        price = data.get("spot_usd_oz")
 
-    return bucket.strftime(
-        "%Y-%m-%d %H:%M"
-    )
+        if price is None:
+            price = data.get("price")
+
+        if price is None:
+            return None
+
+        price = float(price)
+
+        # -------------------------------------------------
+        # PRICE TIME
+        # -------------------------------------------------
+
+        price_as_of = data.get("price_as_of")
+
+        tick_time = parse_timestamp(price_as_of)
+
+        # -------------------------------------------------
+        # SPREAD
+        # -------------------------------------------------
+
+        spread = data.get("spread")
+
+        if spread is not None:
+            try:
+                spread = float(spread)
+            except Exception:
+                spread = None
+
+        # -------------------------------------------------
+        # AGE
+        # -------------------------------------------------
+
+        age_ms = max(
+            0,
+            int(
+                (utc_now() - tick_time).total_seconds()
+                * 1000
+            )
+        )
+
+        return {
+            "price": price,
+            "timestamp": tick_time,
+            "status": status,
+            "age_ms": age_ms,
+            "spread": spread
+        }
+
+    except Exception as e:
+
+        print(
+            f"[DATI] ERRORE FEED: {e}",
+            flush=True
+        )
+
+        return None
 
 
 # =========================================================
-# CHIUSURA M5
+# EMA
 # =========================================================
 
-def close_current_bar(reason="TIME_BOUNDARY", close_time=None):
+def calculate_ema(values, period):
 
-    global current_bucket
-    global current_bar
-    global last_closed_bucket
+    if len(values) < period:
+        return None
 
-    if current_bucket is None:
-        return False
+    multiplier = 2 / (period + 1)
 
-    if current_bar is None:
-        return False
+    ema = sum(values[:period]) / period
 
-    closed_bucket = current_bucket
-    bar = current_bar.copy()
+    for price in values[period:]:
+        ema = (
+            (price - ema) * multiplier
+        ) + ema
 
-    if close_time is None:
-        close_time = datetime.now(timezone.utc)
+    return ema
 
-    print("")
-    print("========================================")
 
-    if reason == "TIME_BOUNDARY":
-        print("[M5 TIME CLOSE] PASS")
+# =========================================================
+# TREND ENGINE
+# =========================================================
+
+def trend_engine():
+
+    if len(candles) < MIN_CANDLES_FOR_TREND:
+        return {
+            "trend": "WAITING",
+            "ema20": None,
+            "ema50": None
+        }
+
+    closes = [
+        candle["close"]
+        for candle in candles
+    ]
+
+    ema20 = calculate_ema(
+        closes,
+        EMA_FAST
+    )
+
+    ema50 = calculate_ema(
+        closes,
+        EMA_SLOW
+    )
+
+    if ema20 is None or ema50 is None:
+
+        return {
+            "trend": "WAITING",
+            "ema20": ema20,
+            "ema50": ema50
+        }
+
+    price = closes[-1]
+
+    if ema20 > ema50 and price > ema20:
+
+        trend = "BUY"
+
+    elif ema20 < ema50 and price < ema20:
+
+        trend = "SELL"
+
     else:
-        print("[M5 CLOSED] PASS")
 
-    print(f"REASON: {reason}")
-    print(f"BUCKET: {format_bucket(closed_bucket)}")
-    print(
-        f"CLOSE_TIME: "
-        f"{close_time.strftime('%Y-%m-%d %H:%M:%S UTC')}"
-    )
-    print(f"OPEN:   {bar['open']:.3f}")
-    print(f"HIGH:   {bar['high']:.3f}")
-    print(f"LOW:    {bar['low']:.3f}")
-    print(f"CLOSE:  {bar['close']:.3f}")
-    print(f"TICKS:  {bar['ticks']}")
-    print("========================================")
-    print("")
+        trend = "NEUTRAL"
 
-    last_closed_bucket = closed_bucket
-
-    current_bucket = None
-    current_bar = None
-
-    return True
+    return {
+        "trend": trend,
+        "ema20": ema20,
+        "ema50": ema50
+    }
 
 
 # =========================================================
-# M5 CLOCK
-#
-# Questa funzione NON dipende dall'arrivo dei tick.
-#
-# Alle 01:45:00 UTC chiude la candela 01:40.
-# Non aspetta il primo tick della 01:45.
+# CANDLE ANALYSIS
 # =========================================================
 
-def m5_boundary_monitor():
+def analyze_candle(candle):
 
-    global current_bucket
+    open_price = candle["open"]
+    high = candle["high"]
+    low = candle["low"]
+    close = candle["close"]
+
+    candle_range = high - low
+    body = abs(close - open_price)
+
+    if candle_range <= 0:
+
+        return {
+            "direction": "DOJI",
+            "body": 0.0,
+            "range": 0.0,
+            "body_ratio": 0.0
+        }
+
+    body_ratio = body / candle_range
+
+    if close > open_price:
+        direction = "BULLISH"
+
+    elif close < open_price:
+        direction = "BEARISH"
+
+    else:
+        direction = "DOJI"
+
+    return {
+        "direction": direction,
+        "body": body,
+        "range": candle_range,
+        "body_ratio": body_ratio
+    }
+
+
+# =========================================================
+# PRINT CLOSED CANDLE
+# =========================================================
+
+def print_closed_candle(candle):
+
+    analysis = analyze_candle(candle)
 
     print(
-        "[M5 CLOCK] Monitor confini temporali attivo"
+        "----------------------------------------",
+        flush=True
     )
 
-    while True:
+    print(
+        "M5 CANDLE CHIUSA",
+        flush=True
+    )
 
-        try:
+    print(
+        f"TIME: {candle['bucket'].strftime('%Y-%m-%d %H:%M')}",
+        flush=True
+    )
 
-            now = datetime.now(timezone.utc)
+    print(
+        f"O: {candle['open']:.3f}",
+        flush=True
+    )
 
-            wall_bucket = current_wall_clock_bucket()
+    print(
+        f"H: {candle['high']:.3f}",
+        flush=True
+    )
 
-            with state_lock:
+    print(
+        f"L: {candle['low']:.3f}",
+        flush=True
+    )
 
-                if (
-                    current_bucket is not None
-                    and current_bar is not None
-                    and current_bucket < wall_bucket
-                ):
+    print(
+        f"C: {candle['close']:.3f}",
+        flush=True
+    )
 
-                    boundary_time = next_boundary_after(
-                        current_bucket
-                    )
+    print(
+        f"DIRECTION: {analysis['direction']}",
+        flush=True
+    )
 
-                    # Se il processo è arrivato oltre il confine
-                    # previsto, il close_time rappresenta comunque
-                    # il confine reale della candela.
-                    close_current_bar(
-                        reason="TIME_BOUNDARY",
-                        close_time=boundary_time
-                    )
+    print(
+        f"BODY: {analysis['body']:.3f}",
+        flush=True
+    )
 
-                    print(
-                        f"[M5 WAITING] NEXT BUCKET: "
-                        f"{format_bucket(wall_bucket)}"
-                    )
+    print(
+        f"RANGE: {analysis['range']:.3f}",
+        flush=True
+    )
 
-            # Calcolo del prossimo confine.
-            next_boundary = (
-                wall_bucket
-                + timedelta(minutes=5)
-            )
+    print(
+        f"BODY/RANGE: {analysis['body_ratio']:.2%}",
+        flush=True
+    )
 
-            seconds_to_boundary = (
-                next_boundary - now
-            ).total_seconds()
+    # -----------------------------------------------------
+    # TREND
+    # -----------------------------------------------------
 
-            # Controllo frequente vicino al confine,
-            # senza creare un loop aggressivo.
-            sleep_time = min(
-                BOUNDARY_CHECK_INTERVAL,
-                max(0.05, seconds_to_boundary)
-            )
+    trend = trend_engine()
 
-            time.sleep(sleep_time)
+    if trend["trend"] == "WAITING":
 
-        except Exception as e:
+        print(
+            "TREND ENGINE: WAITING",
+            flush=True
+        )
+
+    else:
+
+        print(
+            f"TREND ENGINE: {trend['trend']}",
+            flush=True
+        )
+
+        if trend["ema20"] is not None:
 
             print(
-                f"[M5 CLOCK ERROR] "
-                f"{type(e).__name__}: {e}"
+                f"EMA20: {trend['ema20']:.3f}",
+                flush=True
             )
 
-            time.sleep(
-                BOUNDARY_CHECK_INTERVAL
+        if trend["ema50"] is not None:
+
+            print(
+                f"EMA50: {trend['ema50']:.3f}",
+                flush=True
             )
+
+    print(
+        "----------------------------------------",
+        flush=True
+    )
 
 
 # =========================================================
-# FILTRO TICK
+# CLOSE M5 CANDLE
 # =========================================================
 
-def filter_tick(timestamp_ms):
+def close_current_candle():
 
-    global last_tick_ms
-    global ignored_duplicates
-    global ignored_out_of_order
+    global current_candle
 
-    if last_tick_ms is None:
+    if current_candle is None:
+        return
 
-        last_tick_ms = timestamp_ms
+    closed = current_candle.copy()
 
-        return True
+    candles.append(closed)
 
-    # -----------------------------------------------------
-    # DUPLICATO
-    # -----------------------------------------------------
+    if len(candles) > MAX_CANDLES:
+        candles.pop(0)
 
-    if timestamp_ms == last_tick_ms:
+    print_closed_candle(closed)
 
-        ignored_duplicates += 1
-
-        print(
-            f"[TICK DUPLICATE IGNORED] "
-            f"t={timestamp_ms}"
-        )
-
-        return False
-
-    # -----------------------------------------------------
-    # OUT OF ORDER
-    # -----------------------------------------------------
-
-    if timestamp_ms < last_tick_ms:
-
-        ignored_out_of_order += 1
-
-        print(
-            f"[TICK OUT OF ORDER IGNORED] "
-            f"t={timestamp_ms} "
-            f"last={last_tick_ms}"
-        )
-
-        return False
-
-    # -----------------------------------------------------
-    # TICK VALIDO
-    # -----------------------------------------------------
-
-    last_tick_ms = timestamp_ms
-
-    return True
+    current_candle = None
 
 
 # =========================================================
 # PROCESS TICK
 # =========================================================
 
-def process_tick(msg):
+def process_tick(tick):
 
-    global current_bucket
-    global current_bar
-    global accepted_ticks
+    global current_candle
 
-    try:
+    price = tick["price"]
+    timestamp = tick["timestamp"]
 
-        timestamp_ms = int(msg["t"])
-        price = float(msg["p"])
+    bucket = get_m5_bucket(timestamp)
 
-    except (KeyError, TypeError, ValueError):
+    # -----------------------------------------------------
+    # FIRST CANDLE
+    # -----------------------------------------------------
 
-        print(
-            "[TICK ERROR] formato tick non valido"
-        )
+    if current_candle is None:
 
-        return
-
-    # =====================================================
-    # FILTER
-    # =====================================================
-
-    if not filter_tick(timestamp_ms):
-        return
-
-    accepted_ticks += 1
-
-    tick_dt = datetime.fromtimestamp(
-        timestamp_ms / 1000.0,
-        tz=timezone.utc
-    )
-
-    bucket = bucket_from_timestamp_ms(
-        timestamp_ms
-    )
-
-    print(
-        f"[TICK ACCETTATO] "
-        f"UTC={tick_dt.strftime('%Y-%m-%d %H:%M:%S')} "
-        f"PREZZO={price:.3f} "
-        f"BUCKET={format_bucket(bucket)}"
-    )
-
-    # =====================================================
-    # LOCK
-    # =====================================================
-
-    with state_lock:
-
-        # =================================================
-        # PRIMO TICK
-        # =================================================
-
-        if current_bucket is None:
-
-            # Non riaprire una candela già chiusa.
-
-            if (
-                last_closed_bucket is not None
-                and bucket <= last_closed_bucket
-            ):
-
-                print(
-                    f"[M5 OLD TICK IGNORED] "
-                    f"BUCKET={format_bucket(bucket)} "
-                    f"LAST_CLOSED="
-                    f"{format_bucket(last_closed_bucket)}"
-                )
-
-                return
-
-            current_bucket = bucket
-
-            current_bar = {
-                "open": price,
-                "high": price,
-                "low": price,
-                "close": price,
-                "ticks": 1
-            }
-
-            print("")
-            print("[M5 START] PASS")
-            print(
-                f"BUCKET: "
-                f"{format_bucket(bucket)}"
-            )
-            print(
-                f"OPEN:   {price:.3f}"
-            )
-            print("")
-
-            return
-
-        # =================================================
-        # STESSO BUCKET
-        # =================================================
-
-        if bucket == current_bucket:
-
-            current_bar["high"] = max(
-                current_bar["high"],
-                price
-            )
-
-            current_bar["low"] = min(
-                current_bar["low"],
-                price
-            )
-
-            current_bar["close"] = price
-
-            current_bar["ticks"] += 1
-
-            return
-
-        # =================================================
-        # BUCKET SUCCESSIVO
-        #
-        # Normalmente la candela precedente sarà già stata
-        # chiusa dal M5 CLOCK.
-        #
-        # Se il tick arriva prima che il monitor temporale
-        # abbia eseguito il close, facciamo comunque una
-        # chiusura di sicurezza.
-        # =================================================
-
-        if bucket > current_bucket:
-
-            old_bucket = current_bucket
-            new_bucket = bucket
-
-            print("")
-            print("[M5 TRANSITION]")
-            print(
-                f"OLD BUCKET: "
-                f"{format_bucket(old_bucket)}"
-            )
-            print(
-                f"NEW BUCKET: "
-                f"{format_bucket(new_bucket)}"
-            )
-            print("")
-
-            close_current_bar(
-                reason="NEXT_BUCKET",
-                close_time=(
-                    new_bucket
-                )
-            )
-
-            # =================================================
-            # NUOVA CANDELA
-            # =================================================
-
-            current_bucket = bucket
-
-            current_bar = {
-                "open": price,
-                "high": price,
-                "low": price,
-                "close": price,
-                "ticks": 1
-            }
-
-            print("")
-            print("[M5 START] PASS")
-            print(
-                f"BUCKET: "
-                f"{format_bucket(bucket)}"
-            )
-            print(
-                f"OPEN:   {price:.3f}"
-            )
-            print("")
-
-            return
-
-        # =================================================
-        # BUCKET VECCHIO
-        # =================================================
-
-        if bucket < current_bucket:
-
-            print(
-                f"[M5 OLD BUCKET IGNORED] "
-                f"TICK={format_bucket(bucket)} "
-                f"CURRENT={format_bucket(current_bucket)}"
-            )
-
-            return
-
-
-# =========================================================
-# WEBSOCKET OPEN
-# =========================================================
-
-def on_open(ws):
-
-    print("")
-    print("========================================")
-    print("[WEBSOCKET OPEN]")
-    print("========================================")
-    print("")
-
-    subscribe_message = {
-        "op": "subscribe",
-        "product": PRODUCT,
-        "symbols": [SYMBOL]
-    }
-
-    ws.send(
-        json.dumps(subscribe_message)
-    )
-
-    print(
-        "[SUBSCRIBE] XAUUSD SENT"
-    )
-
-
-# =========================================================
-# WEBSOCKET MESSAGE
-# =========================================================
-
-def on_message(ws, message):
-
-    try:
-
-        msg = json.loads(message)
-
-    except json.JSONDecodeError:
+        current_candle = {
+            "bucket": bucket,
+            "open": price,
+            "high": price,
+            "low": price,
+            "close": price
+        }
 
         print(
-            "[JSON ERROR]"
+            f"[M5] NUOVA CANDLE "
+            f"{bucket.strftime('%Y-%m-%d %H:%M')} "
+            f"OPEN={price:.3f}",
+            flush=True
         )
 
         return
 
-    frame_type = msg.get("f")
+    # -----------------------------------------------------
+    # SAME M5 BUCKET
+    # -----------------------------------------------------
 
-    # =====================================================
-    # ACK
-    # =====================================================
+    if bucket == current_candle["bucket"]:
 
-    if frame_type == "ack":
+        current_candle["high"] = max(
+            current_candle["high"],
+            price
+        )
 
-        op = msg.get("op")
+        current_candle["low"] = min(
+            current_candle["low"],
+            price
+        )
 
-        if op == "auth":
-
-            print(
-                f"[AUTH PASS] "
-                f"TIER={msg.get('tier')} "
-                f"MAX_CONN={msg.get('max_conn')} "
-                f"ACTIVE_CONN={msg.get('active_conn')}"
-            )
-
-            return
-
-        if op == "subscribe":
-
-            print(
-                f"[SUBSCRIBE PASS] "
-                f"{msg.get('symbols')}"
-            )
-
-            return
+        current_candle["close"] = price
 
         return
 
-    # =====================================================
-    # PONG
-    # =====================================================
+    # -----------------------------------------------------
+    # NEW M5 BUCKET
+    # -----------------------------------------------------
 
-    if frame_type == "pong":
+    if bucket > current_candle["bucket"]:
+
+        close_current_candle()
+
+        current_candle = {
+            "bucket": bucket,
+            "open": price,
+            "high": price,
+            "low": price,
+            "close": price
+        }
 
         print(
-            "[PING/PONG] PASS"
+            f"[M5] NUOVA CANDLE "
+            f"{bucket.strftime('%Y-%m-%d %H:%M')} "
+            f"OPEN={price:.3f}",
+            flush=True
         )
-
-        return
-
-    # =====================================================
-    # ERROR
-    # =====================================================
-
-    if frame_type == "error":
-
-        print(
-            f"[SIFTING ERROR] "
-            f"CODE={msg.get('code')} "
-            f"MESSAGE={msg.get('message')}"
-        )
-
-        return
-
-    # =====================================================
-    # TICK
-    # =====================================================
-
-    if frame_type == "tick":
-
-        symbol = msg.get("s")
-
-        if symbol != SYMBOL:
-            return
-
-        try:
-
-            timestamp_ms = int(
-                msg["t"]
-            )
-
-            price = float(
-                msg["p"]
-            )
-
-        except (
-            KeyError,
-            TypeError,
-            ValueError
-        ):
-
-            print(
-                "[TICK ERROR] dati mancanti"
-            )
-
-            return
-
-        # =================================================
-        # AGE
-        # =================================================
-
-        now_ms = int(
-            time.time() * 1000
-        )
-
-        age_ms = (
-            now_ms - timestamp_ms
-        )
-
-        # =================================================
-        # BID / ASK / SPREAD
-        # =================================================
-
-        bid = msg.get("b")
-        ask = msg.get("a")
-
-        spread = None
-
-        try:
-
-            if (
-                bid is not None
-                and ask is not None
-            ):
-
-                spread = (
-                    float(ask)
-                    -
-                    float(bid)
-                )
-
-        except (
-            TypeError,
-            ValueError
-        ):
-
-            spread = None
-
-        # =================================================
-        # LIVE DATA LOG
-        # =================================================
-
-        if spread is not None:
-
-            print(
-                f"[DATI] TICK LIVE: PASS "
-                f"PREZZO={price:.3f} "
-                f"ETÀ={age_ms}ms "
-                f"SPREAD={spread:.3f}"
-            )
-
-        else:
-
-            print(
-                f"[DATI] TICK LIVE: PASS "
-                f"PREZZO={price:.3f} "
-                f"ETÀ={age_ms}ms"
-            )
-
-        # =================================================
-        # STALE
-        # =================================================
-
-        if age_ms > 5000:
-
-            print(
-                f"[STALE TICK IGNORED] "
-                f"AGE={age_ms}ms"
-            )
-
-            return
-
-        # =================================================
-        # PROCESS
-        # =================================================
-
-        process_tick(msg)
-
-        return
-
-    # =====================================================
-    # UNKNOWN FRAME
-    # =====================================================
-
-    print(
-        f"[FRAME IGNORED] {msg}"
-    )
-
-
-# =========================================================
-# WEBSOCKET ERROR
-# =========================================================
-
-def on_error(ws, error):
-
-    print(
-        f"[WEBSOCKET ERROR] {error}"
-    )
-
-
-# =========================================================
-# WEBSOCKET CLOSE
-# =========================================================
-
-def on_close(
-    ws,
-    close_status_code,
-    close_msg
-):
-
-    print("")
-    print("========================================")
-    print(
-        f"[WEBSOCKET CLOSED] "
-        f"CODE={close_status_code} "
-        f"MESSAGE={close_msg}"
-    )
-    print("========================================")
-    print("")
 
 
 # =========================================================
 # MAIN
 # =========================================================
 
-def run():
+print(
+    "========================================",
+    flush=True
+)
 
-    # =====================================================
-    # AVVIO MONITOR TEMPORALE M5
-    # =====================================================
+print(
+    "AI XAUUSD SIGNALS V1",
+    flush=True
+)
 
-    boundary_thread = threading.Thread(
-        target=m5_boundary_monitor,
-        name="M5BoundaryMonitor",
-        daemon=True
-    )
+print(
+    "========================================",
+    flush=True
+)
 
-    boundary_thread.start()
+print(
+    "LIVE XAU/USD",
+    flush=True
+)
 
-    attempt = 0
+print(
+    "TIMEFRAME: M5",
+    flush=True
+)
 
-    while True:
+print(
+    "MODE: ANALYSIS ONLY",
+    flush=True
+)
 
-        ws = None
+print(
+    "STEP: 4 - CLOSED M5 CANDLE ENGINE",
+    flush=True
+)
 
-        try:
+print(
+    "========================================",
+    flush=True
+)
 
-            print("")
-            print("========================================")
-            print("AI XAUUSD SIGNALS V1")
-            print("M5 BUILDER")
-            print("LIVE XAUUSD")
-            print("========================================")
 
-            print(
-                f"[CONNECTING] "
-                f"attempt={attempt + 1}"
-            )
+while True:
 
-            ws = websocket.WebSocketApp(
-                WS_URL,
-                on_open=on_open,
-                on_message=on_message,
-                on_error=on_error,
-                on_close=on_close
-            )
+    tick = get_live_tick()
 
-            ws.run_forever(
-                ping_interval=PING_INTERVAL,
-                ping_timeout=PING_TIMEOUT
-            )
+    if tick is None:
 
-        except Exception as e:
+        time.sleep(POLL_SECONDS)
 
-            print(
-                f"[RUN ERROR] "
-                f"{type(e).__name__}: {e}"
-            )
+        continue
 
-        finally:
+    # -----------------------------------------------------
+    # VALIDATION
+    # -----------------------------------------------------
 
-            if ws is not None:
-
-                try:
-
-                    ws.close()
-
-                except Exception:
-
-                    pass
-
-        attempt += 1
+    if tick["status"] != "fresh":
 
         print(
-            f"[RECONNECT] waiting "
-            f"{RECONNECT_WAIT}s"
+            f"[DATI] TICK RIFIUTATO "
+            f"STATUS={tick['status']}",
+            flush=True
         )
 
-        time.sleep(
-            RECONNECT_WAIT
-        )
+        time.sleep(POLL_SECONDS)
 
+        continue
 
-# =========================================================
-# START
-# =========================================================
+    # -----------------------------------------------------
+    # LIVE DATA PASS
+    # -----------------------------------------------------
 
-if __name__ == "__main__":
+    spread_text = (
+        f"{tick['spread']:.3f}"
+        if tick["spread"] is not None
+        else "N/A"
+    )
 
-    run()
+    print(
+        f"[DATI] TICK LIVE: PASS "
+        f"PREZZO={tick['price']:.3f} "
+        f"ETÀ={tick['age_ms']}ms "
+        f"SPREAD={spread_text}",
+        flush=True
+    )
+
+    # -----------------------------------------------------
+    # ACCEPT TICK
+    # -----------------------------------------------------
+
+    bucket = get_m5_bucket(
+        tick["timestamp"]
+    )
+
+    print(
+        f"[TICK ACCETTATO] "
+        f"UTC={tick['timestamp'].strftime('%Y-%m-%d %H:%M:%S')} "
+        f"PREZZO={tick['price']:.3f} "
+        f"BUCKET={bucket.strftime('%Y-%m-%d %H:%M')}",
+        flush=True
+    )
+
+    process_tick(tick)
+
+    time.sleep(POLL_SECONDS)
