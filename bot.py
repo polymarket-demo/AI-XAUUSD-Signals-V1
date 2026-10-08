@@ -1,419 +1,129 @@
-import os
-import json
-import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from types import SimpleNamespace
+from ai_xauusd.models import Tick, Candle
+from ai_xauusd.candles import CandleBuilder
+from ai_xauusd.config import Config
+from ai_xauusd.tracker import Tracker
+from ai_xauusd.pipeline import Signal, Pipeline
+from ai_xauusd.runner import Runner
+from ai_xauusd import engines as E
+from ai_xauusd.stats import verdict
+from ai_xauusd.benchmark import random_baseline
+from ai_xauusd.synth import make_candles
 
-import websocket
+T0 = datetime(2025, 1, 6, 10, 0, tzinfo=timezone.utc)
+M5 = timedelta(minutes=5)
 
 
-# ============================================================
-# AI XAUUSD SIGNALS V1
-# LIVE DATA + M5 CANDLE ENGINE
-# ============================================================
+def mk(i, o, h, l, c, t0=T0):
+    return Candle(t0 + i * M5, t0 + (i + 1) * M5, o, h, l, c, 1)
 
-API_KEY = os.getenv("SIFTING_API_KEY")
 
-WS_URL = f"wss://stream.sifting.io/ws/v1?key={API_KEY}"
+def test_candle_no_lookahead():
+    b = CandleBuilder()
+    assert b.add_tick(Tick(T0, 99.9, 100.1)) is None
+    assert b.add_tick(Tick(T0 + timedelta(minutes=4, seconds=59), 104.9, 105.1)) is None
+    c = b.add_tick(Tick(T0 + timedelta(minutes=5), 101.9, 102.1))
+    assert c and c.open == 100 and c.high == 105 and c.close == 105 and c.tick_count == 2
 
-PRODUCT = "com"
-SYMBOL = "XAUUSD"
 
-RECONNECT_WAIT = 15
+def mk_sig(d="BUY"):
+    return Signal(T0, d, 100, 98 if d == "BUY" else 102, 104 if d == "BUY" else 96, 2, 4, 2, 80, "HIGH",
+                  "BUY", "", "", "", "", "", dict(market="TRENDING", vol="NORMAL_VOL", session="LONDON"), "k", 1.0)
 
-# ============================================================
-# M5 STATE
-# ============================================================
 
-current_bucket = None
+def test_tracker_sl_first_when_both():
+    tr = Tracker(Config()); tr.open_trade(mk_sig())
+    r = tr.on_candle(mk(1, 100, 105, 97, 101))
+    assert r.outcome == "LOSS" and r.r < 0
 
-m5_open = None
-m5_high = None
-m5_low = None
-m5_close = None
 
-last_tick_ms = 0
+def test_tracker_win_sell():
+    tr = Tracker(Config()); tr.open_trade(mk_sig("SELL"))
+    r = tr.on_candle(mk(1, 100, 100.5, 95, 96))
+    assert r.outcome == "WIN" and r.r > 0
 
-closed_candles = []
 
-MAX_CANDLES = 50
+def test_tracker_gap_exit_at_open():
+    tr = Tracker(Config()); tr.last_ts = T0; tr.open_trade(mk_sig())
+    r = tr.on_candle(mk(1, 90, 91, 89, 90, t0=T0 + timedelta(days=3)))   # weekend gap sotto lo SL
+    assert r.outcome == "GAP" and r.exit < 90.5 and r.r < -1
 
 
-# ============================================================
-# UTILS
-# ============================================================
+def _leg_window():
+    w = [mk(i, 100, 100.2, 99.8, 100) for i in range(20)]
+    for k in range(1, 6):
+        w.append(mk(19 + k, 100 + 2 * (k - 1), 100 + 2 * k + .1, 100 + 2 * (k - 1) - .1, 100 + 2 * k))
+    for k, cl in enumerate((108, 106.5, 105)):
+        w.append(mk(25 + k, cl + .7, cl + .8, cl - .2, cl))
+    return w
 
-def get_m5_bucket(tick_ms):
-    dt = datetime.fromtimestamp(
-        tick_ms / 1000,
-        timezone.utc
-    )
 
-    minute = (dt.minute // 5) * 5
+def test_engines_buy_setup():
+    cfg, w = Config(), _leg_window()
+    m = E.momentum_engine(w, 1.0, 1, cfg); assert m["valid"] and m["size_atr"] > 9
+    f = E.fibonacci_engine(w[-1].close, m, 1.0, cfg); assert f["valid"] and abs(f["depth"] - 0.495) < 0.02
+    p = E.pullback_engine(w, m, f["depth"], 100.0, 1.0, cfg); assert p["valid"] and p["type"] == "NORMAL"
+    w[-1] = mk(27, 99.5, 99.6, 98.9, 99.0)                      # chiude sotto l'inizio dell'impulso
+    f2 = E.fibonacci_engine(99.0, m, 1.0, cfg); assert not f2["valid"]
+    p2 = E.pullback_engine(w, m, f2["depth"], 100.0, 1.0, cfg)
+    assert not p2["valid"] and "BROKE_IMPULSE_START" in p2["type"]
 
-    return dt.replace(
-        minute=minute,
-        second=0,
-        microsecond=0
-    )
 
+def test_gap_resets_window():
+    p = Pipeline(Config())
+    for c in make_candles(60, 1): p.on_candle(c)
+    last = p.candles[-1]
+    p.on_candle(mk(0, 100, 101, 99, 100, t0=last.close_ts + timedelta(days=2)))
+    assert len(p.candles) == 1
 
-def add_closed_candle(bucket):
-    global m5_open
-    global m5_high
-    global m5_low
-    global m5_close
 
-    if (
-        m5_open is None
-        or m5_high is None
-        or m5_low is None
-        or m5_close is None
-    ):
-        return
+def test_pipeline_is_causal():
+    cs = make_candles(6000, 3)
+    a, b = Runner(Config(), "A"), Runner(Config(), "B")
+    sa, sb = [], []
+    a.on_signal = lambda s: sa.append((s.ts, s.entry, s.sl, s.tp))
+    b.on_signal = lambda s: sb.append((s.ts, s.entry, s.sl, s.tp))
+    for c in cs[:3000]: a.on_candle(c)
+    for c in cs: b.on_candle(c)
+    cut = cs[2999].close_ts
+    assert sa == [x for x in sb if x[0] <= cut] and len(sa) > 0, "il futuro cambia il passato: look-ahead!"
 
-    candle = {
-        "time": bucket.isoformat(),
-        "open": m5_open,
-        "high": m5_high,
-        "low": m5_low,
-        "close": m5_close
-    }
 
-    closed_candles.append(candle)
+def test_verdict():
+    assert "NON LO SAPPIAMO" in verdict([1.0] * 10)["verdict"]
+    assert "POSSIBILE EDGE" in verdict([1.0, -0.5] * 150)["verdict"]
+    assert "NESSUNA" in verdict([1.0, -1.0] * 150)["verdict"]
 
-    if len(closed_candles) > MAX_CANDLES:
-        closed_candles.pop(0)
 
-    analyze_closed_candle(candle)
+def test_benchmark_runs():
+    cs = make_candles(3000, 5)
+    b = random_baseline(Config(), cs, 20, 1.5, "trend", runs=5)
+    assert b["runs"] == 5 and b["p5"] <= b["p95"]
 
 
-# ============================================================
-# M5 CANDLE ANALYSIS
-# ============================================================
 
-def analyze_closed_candle(candle):
 
-    o = candle["open"]
-    h = candle["high"]
-    l = candle["low"]
-    c = candle["close"]
+def test_sifting_parse():
+    from ai_xauusd.data import SiftingFeed
+    t = SiftingFeed.parse({"p": "2650.5", "t": 1736157600000, "b": 2650.4, "a": 2650.6}, 1736157600120)
+    assert t.bid == 2650.4 and t.ask == 2650.6 and t.latency_ms == 120 and t.ts.year == 2025
+    t2 = SiftingFeed.parse({"p": 2650.5, "t": 1736157600000})            # senza bid/ask
+    assert t2.mid == 2650.5 and t2.spread == 0
+    assert SiftingFeed.parse({"x": 1}) is None
 
-    candle_range = h - l
-    body = abs(c - o)
-
-    if candle_range > 0:
-        body_ratio = body / candle_range
-    else:
-        body_ratio = 0
-
-    if c > o:
-        direction = "BULLISH"
-    elif c < o:
-        direction = "BEARISH"
-    else:
-        direction = "DOJI"
-
-    print("----------------------------------------")
-    print("M5 CANDLE CLOSED")
-    print("----------------------------------------")
-    print(f"TIME: {candle['time']}")
-    print(f"O: {o:.3f}")
-    print(f"H: {h:.3f}")
-    print(f"L: {l:.3f}")
-    print(f"C: {c:.3f}")
-    print(f"RANGE: {candle_range:.3f}")
-    print(f"BODY: {body:.3f}")
-    print(f"BODY/RANGE: {body_ratio:.2%}")
-    print(f"DIRECTION: {direction}")
-    print("----------------------------------------")
-
-
-# ============================================================
-# START NEW M5 CANDLE
-# ============================================================
-
-def start_new_candle(bucket, price):
-
-    global current_bucket
-    global m5_open
-    global m5_high
-    global m5_low
-    global m5_close
-
-    current_bucket = bucket
-
-    m5_open = price
-    m5_high = price
-    m5_low = price
-    m5_close = price
-
-    print(
-        f"[M5 START] "
-        f"BUCKET={bucket.strftime('%Y-%m-%d %H:%M:%S')} "
-        f"O={price:.3f}"
-    )
-
-
-# ============================================================
-# PROCESS TICK
-# ============================================================
-
-def process_tick(message):
-
-    global last_tick_ms
-    global current_bucket
-    global m5_open
-    global m5_high
-    global m5_low
-    global m5_close
-
-    try:
-        price = float(message["p"])
-        tick_ms = int(message["t"])
-    except (KeyError, TypeError, ValueError):
-        return
 
-    # --------------------------------------------------------
-    # Reject old / duplicate ticks
-    # --------------------------------------------------------
+def test_candles_persist_and_warmup():
+    from ai_xauusd.logger import DbLogger
+    log = DbLogger(":memory:")
+    cs = make_candles(120, 2)
+    for c in cs: log.candle(c)
+    back = log.recent_candles(100)
+    assert len(back) == 100 and back[-1].close == cs[-1].close and back[0].open_ts == cs[20].open_ts
+    r = Runner(Config(), "W"); r.warmup(back)
+    assert r.pipe.ema_s.value is not None and r.trades == [] and r.tracker.open is None
 
-    if tick_ms <= last_tick_ms:
-        return
-
-    last_tick_ms = tick_ms
-
-    # --------------------------------------------------------
-    # Timestamp / age
-    # --------------------------------------------------------
-
-    now_ms = int(time.time() * 1000)
-
-    age_ms = now_ms - tick_ms
-
-    # --------------------------------------------------------
-    # Bid / Ask / Spread
-    # --------------------------------------------------------
-
-    bid = message.get("b")
-    ask = message.get("a")
-
-    spread = None
-
-    try:
-        if bid is not None and ask is not None:
-            bid = float(bid)
-            ask = float(ask)
-            spread = ask - bid
-    except (TypeError, ValueError):
-        spread = None
-
-    # --------------------------------------------------------
-    # M5 bucket
-    # --------------------------------------------------------
-
-    bucket = get_m5_bucket(tick_ms)
-
-    # --------------------------------------------------------
-    # Live tick
-    # --------------------------------------------------------
-
-    if spread is not None:
-        print(
-            f"[DATI] TICK LIVE: PASS "
-            f"PREZZO={price:.3f} "
-            f"ETÀ={age_ms}ms "
-            f"SPREAD={spread:.3f}"
-        )
-    else:
-        print(
-            f"[DATI] TICK LIVE: PASS "
-            f"PREZZO={price:.3f} "
-            f"ETÀ={age_ms}ms"
-        )
-
-    # --------------------------------------------------------
-    # First M5 candle
-    # --------------------------------------------------------
-
-    if current_bucket is None:
-
-        start_new_candle(bucket, price)
-
-        return
-
-    # --------------------------------------------------------
-    # Same M5 candle
-    # --------------------------------------------------------
-
-    if bucket == current_bucket:
-
-        if price > m5_high:
-            m5_high = price
-
-        if price < m5_low:
-            m5_low = price
-
-        m5_close = price
-
-        print(
-            f"[TICK ACCETTATO] "
-            f"BUCKET={bucket.strftime('%Y-%m-%d %H:%M:%S')} "
-            f"PRICE={price:.3f}"
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # New M5 candle
-    # --------------------------------------------------------
-
-    if bucket > current_bucket:
-
-        previous_bucket = current_bucket
-
-        # Close previous candle
-        add_closed_candle(previous_bucket)
-
-        # Start new candle
-        start_new_candle(bucket, price)
-
-
-# ============================================================
-# WEBSOCKET CALLBACKS
-# ============================================================
-
-def on_open(ws):
-
-    print("----------------------------------------")
-    print("WEBSOCKET CONNECTED")
-    print("----------------------------------------")
-
-    subscribe_message = {
-        "op": "subscribe",
-        "product": PRODUCT,
-        "symbols": [SYMBOL]
-    }
-
-    ws.send(json.dumps(subscribe_message))
-
-    print("[SUBSCRIBE] XAUUSD SENT")
-
-
-def on_message(ws, raw_message):
-
-    try:
-        message = json.loads(raw_message)
-    except json.JSONDecodeError:
-        return
-
-    # --------------------------------------------------------
-    # AUTH
-    # --------------------------------------------------------
-
-    if message.get("f") == "ack":
-        print("[AUTH PASS] ACK")
-        return
-
-    if message.get("op") == "auth":
-        print("[AUTH PASS]")
-        return
-
-    # --------------------------------------------------------
-    # ERROR
-    # --------------------------------------------------------
-
-    if message.get("f") == "error":
-
-        print(
-            f"[WEBSOCKET ERROR] "
-            f"{message}"
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # Tick
-    # --------------------------------------------------------
-
-    if "p" in message and "t" in message:
-
-        process_tick(message)
-
-
-def on_error(ws, error):
-
-    print(
-        f"[WEBSOCKET ERROR] {error}"
-    )
-
-
-def on_close(ws, close_status_code, close_msg):
-
-    print("----------------------------------------")
-    print("WEBSOCKET CLOSED")
-    print(
-        f"CODE={close_status_code} "
-        f"MSG={close_msg}"
-    )
-    print("----------------------------------------")
-
-
-# ============================================================
-# MAIN LOOP
-# ============================================================
-
-def run():
-
-    if not API_KEY:
-
-        print(
-            "ERRORE: SIFTING_API_KEY non configurata."
-        )
-
-        return
-
-    print("========================================")
-    print("AI XAUUSD SIGNALS V1")
-    print("========================================")
-    print("LIVE XAU/USD")
-    print("M5 CANDLE ENGINE")
-    print("MODE: ANALYSIS ONLY")
-    print("========================================")
-
-    while True:
-
-        try:
-
-            ws = websocket.WebSocketApp(
-                WS_URL,
-                on_open=on_open,
-                on_message=on_message,
-                on_error=on_error,
-                on_close=on_close
-            )
-
-            ws.run_forever(
-                ping_interval=30,
-                ping_timeout=10
-            )
-
-        except Exception as e:
-
-            print(
-                f"[CONNECTION EXCEPTION] {e}"
-            )
-
-        print(
-            f"[RECONNECT] "
-            f"attendo {RECONNECT_WAIT}s..."
-        )
-
-        time.sleep(RECONNECT_WAIT)
-
-
-# ============================================================
-# START
-# ============================================================
 
 if __name__ == "__main__":
-    run()
+    for n, f in list(globals().items()):
+        if n.startswith("test_"): f(); print("OK", n)
