@@ -2,7 +2,7 @@ import os
 import json
 import time
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import websocket
 
@@ -28,6 +28,9 @@ PRODUCT = "com"
 RECONNECT_WAIT = 15
 PING_INTERVAL = 30
 PING_TIMEOUT = 10
+
+# Controllo orologio M5 indipendente dai tick
+BOUNDARY_CHECK_INTERVAL = 0.20
 
 
 # =========================================================
@@ -67,6 +70,24 @@ def bucket_from_timestamp_ms(timestamp_ms):
     )
 
 
+def current_wall_clock_bucket():
+
+    now = datetime.now(timezone.utc)
+
+    minute = (now.minute // 5) * 5
+
+    return now.replace(
+        minute=minute,
+        second=0,
+        microsecond=0
+    )
+
+
+def next_boundary_after(bucket):
+
+    return bucket + timedelta(minutes=5)
+
+
 def format_bucket(bucket):
 
     if bucket is None:
@@ -81,35 +102,38 @@ def format_bucket(bucket):
 # CHIUSURA M5
 # =========================================================
 
-def close_current_bar(reason="NEXT_BUCKET"):
+def close_current_bar(reason="TIME_BOUNDARY", close_time=None):
 
     global current_bucket
     global current_bar
     global last_closed_bucket
 
-    # IMPORTANTE:
-    # questa funzione viene chiamata anche mentre
-    # state_lock è già acquisito da process_tick().
-    #
-    # NON deve quindi fare:
-    # with state_lock:
-    #
-    # Questo evita il deadlock.
-
     if current_bucket is None:
-        return
+        return False
 
     if current_bar is None:
-        return
+        return False
 
     closed_bucket = current_bucket
     bar = current_bar.copy()
 
+    if close_time is None:
+        close_time = datetime.now(timezone.utc)
+
     print("")
     print("========================================")
-    print("[M5 CLOSED] PASS")
+
+    if reason == "TIME_BOUNDARY":
+        print("[M5 TIME CLOSE] PASS")
+    else:
+        print("[M5 CLOSED] PASS")
+
     print(f"REASON: {reason}")
     print(f"BUCKET: {format_bucket(closed_bucket)}")
+    print(
+        f"CLOSE_TIME: "
+        f"{close_time.strftime('%Y-%m-%d %H:%M:%S UTC')}"
+    )
     print(f"OPEN:   {bar['open']:.3f}")
     print(f"HIGH:   {bar['high']:.3f}")
     print(f"LOW:    {bar['low']:.3f}")
@@ -122,6 +146,89 @@ def close_current_bar(reason="NEXT_BUCKET"):
 
     current_bucket = None
     current_bar = None
+
+    return True
+
+
+# =========================================================
+# M5 CLOCK
+#
+# Questa funzione NON dipende dall'arrivo dei tick.
+#
+# Alle 01:45:00 UTC chiude la candela 01:40.
+# Non aspetta il primo tick della 01:45.
+# =========================================================
+
+def m5_boundary_monitor():
+
+    global current_bucket
+
+    print(
+        "[M5 CLOCK] Monitor confini temporali attivo"
+    )
+
+    while True:
+
+        try:
+
+            now = datetime.now(timezone.utc)
+
+            wall_bucket = current_wall_clock_bucket()
+
+            with state_lock:
+
+                if (
+                    current_bucket is not None
+                    and current_bar is not None
+                    and current_bucket < wall_bucket
+                ):
+
+                    boundary_time = next_boundary_after(
+                        current_bucket
+                    )
+
+                    # Se il processo è arrivato oltre il confine
+                    # previsto, il close_time rappresenta comunque
+                    # il confine reale della candela.
+                    close_current_bar(
+                        reason="TIME_BOUNDARY",
+                        close_time=boundary_time
+                    )
+
+                    print(
+                        f"[M5 WAITING] NEXT BUCKET: "
+                        f"{format_bucket(wall_bucket)}"
+                    )
+
+            # Calcolo del prossimo confine.
+            next_boundary = (
+                wall_bucket
+                + timedelta(minutes=5)
+            )
+
+            seconds_to_boundary = (
+                next_boundary - now
+            ).total_seconds()
+
+            # Controllo frequente vicino al confine,
+            # senza creare un loop aggressivo.
+            sleep_time = min(
+                BOUNDARY_CHECK_INTERVAL,
+                max(0.05, seconds_to_boundary)
+            )
+
+            time.sleep(sleep_time)
+
+        except Exception as e:
+
+            print(
+                f"[M5 CLOCK ERROR] "
+                f"{type(e).__name__}: {e}"
+            )
+
+            time.sleep(
+                BOUNDARY_CHECK_INTERVAL
+            )
 
 
 # =========================================================
@@ -155,7 +262,6 @@ def filter_tick(timestamp_ms):
 
         return False
 
-
     # -----------------------------------------------------
     # OUT OF ORDER
     # -----------------------------------------------------
@@ -171,7 +277,6 @@ def filter_tick(timestamp_ms):
         )
 
         return False
-
 
     # -----------------------------------------------------
     # TICK VALIDO
@@ -205,7 +310,6 @@ def process_tick(msg):
 
         return
 
-
     # =====================================================
     # FILTER
     # =====================================================
@@ -213,9 +317,7 @@ def process_tick(msg):
     if not filter_tick(timestamp_ms):
         return
 
-
     accepted_ticks += 1
-
 
     tick_dt = datetime.fromtimestamp(
         timestamp_ms / 1000.0,
@@ -226,14 +328,12 @@ def process_tick(msg):
         timestamp_ms
     )
 
-
     print(
         f"[TICK ACCETTATO] "
         f"UTC={tick_dt.strftime('%Y-%m-%d %H:%M:%S')} "
         f"PREZZO={price:.3f} "
         f"BUCKET={format_bucket(bucket)}"
     )
-
 
     # =====================================================
     # LOCK
@@ -247,8 +347,7 @@ def process_tick(msg):
 
         if current_bucket is None:
 
-            # Se appartiene a una candela già chiusa,
-            # non la riapriamo.
+            # Non riaprire una candela già chiusa.
 
             if (
                 last_closed_bucket is not None
@@ -264,7 +363,6 @@ def process_tick(msg):
 
                 return
 
-
             current_bucket = bucket
 
             current_bar = {
@@ -274,7 +372,6 @@ def process_tick(msg):
                 "close": price,
                 "ticks": 1
             }
-
 
             print("")
             print("[M5 START] PASS")
@@ -288,7 +385,6 @@ def process_tick(msg):
             print("")
 
             return
-
 
         # =================================================
         # STESSO BUCKET
@@ -312,16 +408,21 @@ def process_tick(msg):
 
             return
 
-
         # =================================================
         # BUCKET SUCCESSIVO
+        #
+        # Normalmente la candela precedente sarà già stata
+        # chiusa dal M5 CLOCK.
+        #
+        # Se il tick arriva prima che il monitor temporale
+        # abbia eseguito il close, facciamo comunque una
+        # chiusura di sicurezza.
         # =================================================
 
         if bucket > current_bucket:
 
             old_bucket = current_bucket
             new_bucket = bucket
-
 
             print("")
             print("[M5 TRANSITION]")
@@ -335,19 +436,12 @@ def process_tick(msg):
             )
             print("")
 
-
-            # -------------------------------------------------
-            # CHIUSURA DELLA CANDELA PRECEDENTE
-            #
-            # ATTENZIONE:
-            # close_current_bar() NON acquisisce il lock.
-            # Questo evita il deadlock.
-            # -------------------------------------------------
-
             close_current_bar(
-                reason="NEXT_BUCKET"
+                reason="NEXT_BUCKET",
+                close_time=(
+                    new_bucket
+                )
             )
-
 
             # =================================================
             # NUOVA CANDELA
@@ -363,7 +457,6 @@ def process_tick(msg):
                 "ticks": 1
             }
 
-
             print("")
             print("[M5 START] PASS")
             print(
@@ -376,7 +469,6 @@ def process_tick(msg):
             print("")
 
             return
-
 
         # =================================================
         # BUCKET VECCHIO
@@ -405,18 +497,15 @@ def on_open(ws):
     print("========================================")
     print("")
 
-
     subscribe_message = {
         "op": "subscribe",
         "product": PRODUCT,
         "symbols": [SYMBOL]
     }
 
-
     ws.send(
         json.dumps(subscribe_message)
     )
-
 
     print(
         "[SUBSCRIBE] XAUUSD SENT"
@@ -441,9 +530,7 @@ def on_message(ws, message):
 
         return
 
-
     frame_type = msg.get("f")
-
 
     # =====================================================
     # ACK
@@ -452,7 +539,6 @@ def on_message(ws, message):
     if frame_type == "ack":
 
         op = msg.get("op")
-
 
         if op == "auth":
 
@@ -465,7 +551,6 @@ def on_message(ws, message):
 
             return
 
-
         if op == "subscribe":
 
             print(
@@ -475,9 +560,7 @@ def on_message(ws, message):
 
             return
 
-
         return
-
 
     # =====================================================
     # PONG
@@ -490,7 +573,6 @@ def on_message(ws, message):
         )
 
         return
-
 
     # =====================================================
     # ERROR
@@ -506,7 +588,6 @@ def on_message(ws, message):
 
         return
 
-
     # =====================================================
     # TICK
     # =====================================================
@@ -515,10 +596,8 @@ def on_message(ws, message):
 
         symbol = msg.get("s")
 
-
         if symbol != SYMBOL:
             return
-
 
         try:
 
@@ -542,7 +621,6 @@ def on_message(ws, message):
 
             return
 
-
         # =================================================
         # AGE
         # =================================================
@@ -555,7 +633,6 @@ def on_message(ws, message):
             now_ms - timestamp_ms
         )
 
-
         # =================================================
         # BID / ASK / SPREAD
         # =================================================
@@ -564,7 +641,6 @@ def on_message(ws, message):
         ask = msg.get("a")
 
         spread = None
-
 
         try:
 
@@ -585,7 +661,6 @@ def on_message(ws, message):
         ):
 
             spread = None
-
 
         # =================================================
         # LIVE DATA LOG
@@ -608,7 +683,6 @@ def on_message(ws, message):
                 f"ETÀ={age_ms}ms"
             )
 
-
         # =================================================
         # STALE
         # =================================================
@@ -622,7 +696,6 @@ def on_message(ws, message):
 
             return
 
-
         # =================================================
         # PROCESS
         # =================================================
@@ -630,7 +703,6 @@ def on_message(ws, message):
         process_tick(msg)
 
         return
-
 
     # =====================================================
     # UNKNOWN FRAME
@@ -679,13 +751,23 @@ def on_close(
 
 def run():
 
-    attempt = 0
+    # =====================================================
+    # AVVIO MONITOR TEMPORALE M5
+    # =====================================================
 
+    boundary_thread = threading.Thread(
+        target=m5_boundary_monitor,
+        name="M5BoundaryMonitor",
+        daemon=True
+    )
+
+    boundary_thread.start()
+
+    attempt = 0
 
     while True:
 
         ws = None
-
 
         try:
 
@@ -701,7 +783,6 @@ def run():
                 f"attempt={attempt + 1}"
             )
 
-
             ws = websocket.WebSocketApp(
                 WS_URL,
                 on_open=on_open,
@@ -710,12 +791,10 @@ def run():
                 on_close=on_close
             )
 
-
             ws.run_forever(
                 ping_interval=PING_INTERVAL,
                 ping_timeout=PING_TIMEOUT
             )
-
 
         except Exception as e:
 
@@ -723,7 +802,6 @@ def run():
                 f"[RUN ERROR] "
                 f"{type(e).__name__}: {e}"
             )
-
 
         finally:
 
@@ -737,15 +815,12 @@ def run():
 
                     pass
 
-
         attempt += 1
-
 
         print(
             f"[RECONNECT] waiting "
             f"{RECONNECT_WAIT}s"
         )
-
 
         time.sleep(
             RECONNECT_WAIT
