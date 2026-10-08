@@ -9,13 +9,15 @@ import websocket
 
 # =========================================================
 # AI XAUUSD SIGNALS V1
-# M5 BUILDER V1.4
+# M5 BUILDER
 # =========================================================
 
 API_KEY = os.getenv("SIFTING_API_KEY")
 
 if not API_KEY:
-    raise RuntimeError("SIFTING_API_KEY non trovata nelle Railway Variables")
+    raise RuntimeError(
+        "SIFTING_API_KEY non trovata nelle Railway Variables"
+    )
 
 
 WS_URL = f"wss://stream.sifting.io/ws/v1?key={API_KEY}"
@@ -29,7 +31,7 @@ PING_TIMEOUT = 10
 
 
 # =========================================================
-# STATO GLOBALE
+# STATO
 # =========================================================
 
 state_lock = threading.Lock()
@@ -46,17 +48,10 @@ ignored_out_of_order = 0
 
 
 # =========================================================
-# UTILITY
+# TIME / BUCKET
 # =========================================================
 
-def utc_now():
-    return datetime.now(timezone.utc)
-
-
 def bucket_from_timestamp_ms(timestamp_ms):
-    """
-    Trasforma il timestamp del tick nel relativo bucket M5.
-    """
 
     dt = datetime.fromtimestamp(
         timestamp_ms / 1000.0,
@@ -73,37 +68,13 @@ def bucket_from_timestamp_ms(timestamp_ms):
 
 
 def format_bucket(bucket):
+
     if bucket is None:
         return "NONE"
 
-    return bucket.strftime("%Y-%m-%d %H:%M")
-
-
-# =========================================================
-# LOG STATO
-# =========================================================
-
-def print_state(prefix="[M5 STATE]"):
-
-    with state_lock:
-
-        if current_bar is None:
-            print(
-                f"{prefix} "
-                f"BUCKET={format_bucket(current_bucket)} "
-                f"BAR=NONE"
-            )
-            return
-
-        print(
-            f"{prefix} "
-            f"BUCKET={format_bucket(current_bucket)} "
-            f"OPEN={current_bar['open']:.3f} "
-            f"HIGH={current_bar['high']:.3f} "
-            f"LOW={current_bar['low']:.3f} "
-            f"CLOSE={current_bar['close']:.3f} "
-            f"TICKS={current_bar['ticks']}"
-        )
+    return bucket.strftime(
+        "%Y-%m-%d %H:%M"
+    )
 
 
 # =========================================================
@@ -116,7 +87,19 @@ def close_current_bar(reason="NEXT_BUCKET"):
     global current_bar
     global last_closed_bucket
 
-    if current_bucket is None or current_bar is None:
+    # IMPORTANTE:
+    # questa funzione viene chiamata anche mentre
+    # state_lock è già acquisito da process_tick().
+    #
+    # NON deve quindi fare:
+    # with state_lock:
+    #
+    # Questo evita il deadlock.
+
+    if current_bucket is None:
+        return
+
+    if current_bar is None:
         return
 
     closed_bucket = current_bucket
@@ -157,6 +140,10 @@ def filter_tick(timestamp_ms):
 
         return True
 
+    # -----------------------------------------------------
+    # DUPLICATO
+    # -----------------------------------------------------
+
     if timestamp_ms == last_tick_ms:
 
         ignored_duplicates += 1
@@ -167,6 +154,11 @@ def filter_tick(timestamp_ms):
         )
 
         return False
+
+
+    # -----------------------------------------------------
+    # OUT OF ORDER
+    # -----------------------------------------------------
 
     if timestamp_ms < last_tick_ms:
 
@@ -180,13 +172,18 @@ def filter_tick(timestamp_ms):
 
         return False
 
+
+    # -----------------------------------------------------
+    # TICK VALIDO
+    # -----------------------------------------------------
+
     last_tick_ms = timestamp_ms
 
     return True
 
 
 # =========================================================
-# PROCESSAMENTO TICK
+# PROCESS TICK
 # =========================================================
 
 def process_tick(msg):
@@ -202,14 +199,16 @@ def process_tick(msg):
 
     except (KeyError, TypeError, ValueError):
 
-        print("[TICK ERROR] formato tick non valido")
+        print(
+            "[TICK ERROR] formato tick non valido"
+        )
 
         return
 
 
-    # -----------------------------------------------------
-    # FILTRO
-    # -----------------------------------------------------
+    # =====================================================
+    # FILTER
+    # =====================================================
 
     if not filter_tick(timestamp_ms):
         return
@@ -223,27 +222,34 @@ def process_tick(msg):
         tz=timezone.utc
     )
 
-    bucket = bucket_from_timestamp_ms(timestamp_ms)
+    bucket = bucket_from_timestamp_ms(
+        timestamp_ms
+    )
 
 
     print(
         f"[TICK ACCETTATO] "
         f"UTC={tick_dt.strftime('%Y-%m-%d %H:%M:%S')} "
-        f"PRICE={price:.3f} "
+        f"PREZZO={price:.3f} "
         f"BUCKET={format_bucket(bucket)}"
     )
 
 
+    # =====================================================
+    # LOCK
+    # =====================================================
+
     with state_lock:
 
-        # -------------------------------------------------
+        # =================================================
         # PRIMO TICK
-        # -------------------------------------------------
+        # =================================================
 
         if current_bucket is None:
 
-            # Se il tick appartiene a una candela già chiusa,
-            # lo ignoriamo.
+            # Se appartiene a una candela già chiusa,
+            # non la riapriamo.
+
             if (
                 last_closed_bucket is not None
                 and bucket <= last_closed_bucket
@@ -252,7 +258,8 @@ def process_tick(msg):
                 print(
                     f"[M5 OLD TICK IGNORED] "
                     f"BUCKET={format_bucket(bucket)} "
-                    f"LAST_CLOSED={format_bucket(last_closed_bucket)}"
+                    f"LAST_CLOSED="
+                    f"{format_bucket(last_closed_bucket)}"
                 )
 
                 return
@@ -268,18 +275,24 @@ def process_tick(msg):
                 "ticks": 1
             }
 
+
             print("")
             print("[M5 START] PASS")
-            print(f"BUCKET: {format_bucket(bucket)}")
-            print(f"OPEN:   {price:.3f}")
+            print(
+                f"BUCKET: "
+                f"{format_bucket(bucket)}"
+            )
+            print(
+                f"OPEN:   {price:.3f}"
+            )
             print("")
 
             return
 
 
-        # -------------------------------------------------
+        # =================================================
         # STESSO BUCKET
-        # -------------------------------------------------
+        # =================================================
 
         if bucket == current_bucket:
 
@@ -300,31 +313,46 @@ def process_tick(msg):
             return
 
 
-        # -------------------------------------------------
+        # =================================================
         # BUCKET SUCCESSIVO
-        # -------------------------------------------------
+        # =================================================
 
         if bucket > current_bucket:
 
             old_bucket = current_bucket
             new_bucket = bucket
 
+
             print("")
             print("[M5 TRANSITION]")
             print(
-                f"OLD BUCKET: {format_bucket(old_bucket)}"
+                f"OLD BUCKET: "
+                f"{format_bucket(old_bucket)}"
             )
             print(
-                f"NEW BUCKET: {format_bucket(new_bucket)}"
+                f"NEW BUCKET: "
+                f"{format_bucket(new_bucket)}"
             )
             print("")
 
-            # Chiude la candela precedente
+
+            # -------------------------------------------------
+            # CHIUSURA DELLA CANDELA PRECEDENTE
+            #
+            # ATTENZIONE:
+            # close_current_bar() NON acquisisce il lock.
+            # Questo evita il deadlock.
+            # -------------------------------------------------
+
             close_current_bar(
                 reason="NEXT_BUCKET"
             )
 
-            # Nuova candela
+
+            # =================================================
+            # NUOVA CANDELA
+            # =================================================
+
             current_bucket = bucket
 
             current_bar = {
@@ -335,18 +363,24 @@ def process_tick(msg):
                 "ticks": 1
             }
 
+
             print("")
             print("[M5 START] PASS")
-            print(f"BUCKET: {format_bucket(bucket)}")
-            print(f"OPEN:   {price:.3f}")
+            print(
+                f"BUCKET: "
+                f"{format_bucket(bucket)}"
+            )
+            print(
+                f"OPEN:   {price:.3f}"
+            )
             print("")
 
             return
 
 
-        # -------------------------------------------------
-        # TICK DI UN BUCKET VECCHIO
-        # -------------------------------------------------
+        # =================================================
+        # BUCKET VECCHIO
+        # =================================================
 
         if bucket < current_bucket:
 
@@ -360,7 +394,7 @@ def process_tick(msg):
 
 
 # =========================================================
-# WEBSOCKET
+# WEBSOCKET OPEN
 # =========================================================
 
 def on_open(ws):
@@ -371,21 +405,29 @@ def on_open(ws):
     print("========================================")
     print("")
 
+
     subscribe_message = {
         "op": "subscribe",
         "product": PRODUCT,
         "symbols": [SYMBOL]
     }
 
-    ws.send(json.dumps(subscribe_message))
 
-    print("[SUBSCRIBE] XAUUSD SENT")
+    ws.send(
+        json.dumps(subscribe_message)
+    )
 
+
+    print(
+        "[SUBSCRIBE] XAUUSD SENT"
+    )
+
+
+# =========================================================
+# WEBSOCKET MESSAGE
+# =========================================================
 
 def on_message(ws, message):
-
-    global ignored_duplicates
-    global ignored_out_of_order
 
     try:
 
@@ -393,7 +435,10 @@ def on_message(ws, message):
 
     except json.JSONDecodeError:
 
-        print("[JSON ERROR]")
+        print(
+            "[JSON ERROR]"
+        )
+
         return
 
 
@@ -401,12 +446,13 @@ def on_message(ws, message):
 
 
     # =====================================================
-    # AUTH
+    # ACK
     # =====================================================
 
     if frame_type == "ack":
 
         op = msg.get("op")
+
 
         if op == "auth":
 
@@ -417,12 +463,18 @@ def on_message(ws, message):
                 f"ACTIVE_CONN={msg.get('active_conn')}"
             )
 
-        elif op == "subscribe":
+            return
+
+
+        if op == "subscribe":
 
             print(
-                "[SUBSCRIBE PASS] "
+                f"[SUBSCRIBE PASS] "
                 f"{msg.get('symbols')}"
             )
+
+            return
+
 
         return
 
@@ -433,7 +485,9 @@ def on_message(ws, message):
 
     if frame_type == "pong":
 
-        print("[PING/PONG] PASS")
+        print(
+            "[PING/PONG] PASS"
+        )
 
         return
 
@@ -461,65 +515,103 @@ def on_message(ws, message):
 
         symbol = msg.get("s")
 
+
         if symbol != SYMBOL:
             return
 
 
         try:
 
-            timestamp_ms = int(msg["t"])
-            price = float(msg["p"])
+            timestamp_ms = int(
+                msg["t"]
+            )
 
-        except (KeyError, TypeError, ValueError):
+            price = float(
+                msg["p"]
+            )
 
-            print("[TICK ERROR] dati mancanti")
+        except (
+            KeyError,
+            TypeError,
+            ValueError
+        ):
+
+            print(
+                "[TICK ERROR] dati mancanti"
+            )
 
             return
 
 
-        now_ms = int(time.time() * 1000)
+        # =================================================
+        # AGE
+        # =================================================
 
-        age_ms = now_ms - timestamp_ms
+        now_ms = int(
+            time.time() * 1000
+        )
 
+        age_ms = (
+            now_ms - timestamp_ms
+        )
+
+
+        # =================================================
+        # BID / ASK / SPREAD
+        # =================================================
 
         bid = msg.get("b")
         ask = msg.get("a")
 
-
         spread = None
+
 
         try:
 
-            if bid is not None and ask is not None:
+            if (
+                bid is not None
+                and ask is not None
+            ):
 
-                spread = float(ask) - float(bid)
+                spread = (
+                    float(ask)
+                    -
+                    float(bid)
+                )
 
-        except (TypeError, ValueError):
+        except (
+            TypeError,
+            ValueError
+        ):
 
             spread = None
 
 
+        # =================================================
+        # LIVE DATA LOG
+        # =================================================
+
         if spread is not None:
 
             print(
-                f"[DATA] LIVE TICK: PASS "
-                f"PRICE={price:.3f} "
-                f"AGE={age_ms}ms "
+                f"[DATI] TICK LIVE: PASS "
+                f"PREZZO={price:.3f} "
+                f"ETÀ={age_ms}ms "
                 f"SPREAD={spread:.3f}"
             )
 
         else:
 
             print(
-                f"[DATA] LIVE TICK: PASS "
-                f"PRICE={price:.3f} "
-                f"AGE={age_ms}ms"
+                f"[DATI] TICK LIVE: PASS "
+                f"PREZZO={price:.3f} "
+                f"ETÀ={age_ms}ms"
             )
 
 
-        # -------------------------------------------------
-        # BLOCCO STALE
-        # -------------------------------------------------
+        # =================================================
+        # STALE
+        # =================================================
 
         if age_ms > 5000:
 
@@ -531,20 +623,27 @@ def on_message(ws, message):
             return
 
 
+        # =================================================
+        # PROCESS
+        # =================================================
+
         process_tick(msg)
 
         return
 
 
     # =====================================================
-    # FRAME SCONOSCIUTO
+    # UNKNOWN FRAME
     # =====================================================
 
     print(
-        f"[FRAME IGNORED] "
-        f"{msg}"
+        f"[FRAME IGNORED] {msg}"
     )
 
+
+# =========================================================
+# WEBSOCKET ERROR
+# =========================================================
 
 def on_error(ws, error):
 
@@ -553,7 +652,15 @@ def on_error(ws, error):
     )
 
 
-def on_close(ws, close_status_code, close_msg):
+# =========================================================
+# WEBSOCKET CLOSE
+# =========================================================
+
+def on_close(
+    ws,
+    close_status_code,
+    close_msg
+):
 
     print("")
     print("========================================")
@@ -574,21 +681,26 @@ def run():
 
     attempt = 0
 
+
     while True:
 
         ws = None
+
 
         try:
 
             print("")
             print("========================================")
             print("AI XAUUSD SIGNALS V1")
-            print("M5 BUILDER V1.4")
+            print("M5 BUILDER")
             print("LIVE XAUUSD")
             print("========================================")
+
             print(
-                f"[CONNECTING] attempt={attempt + 1}"
+                f"[CONNECTING] "
+                f"attempt={attempt + 1}"
             )
+
 
             ws = websocket.WebSocketApp(
                 WS_URL,
@@ -598,37 +710,52 @@ def run():
                 on_close=on_close
             )
 
+
             ws.run_forever(
                 ping_interval=PING_INTERVAL,
                 ping_timeout=PING_TIMEOUT
             )
 
+
         except Exception as e:
 
             print(
-                f"[RUN ERROR] {type(e).__name__}: {e}"
+                f"[RUN ERROR] "
+                f"{type(e).__name__}: {e}"
             )
+
 
         finally:
 
             if ws is not None:
 
                 try:
+
                     ws.close()
 
                 except Exception:
+
                     pass
 
 
         attempt += 1
+
 
         print(
             f"[RECONNECT] waiting "
             f"{RECONNECT_WAIT}s"
         )
 
-        time.sleep(RECONNECT_WAIT)
 
+        time.sleep(
+            RECONNECT_WAIT
+        )
+
+
+# =========================================================
+# START
+# =========================================================
 
 if __name__ == "__main__":
+
     run()
