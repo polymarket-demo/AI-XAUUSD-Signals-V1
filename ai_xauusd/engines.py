@@ -1,3 +1,4 @@
+
 from .indicators import atr, ema
 
 
@@ -51,6 +52,8 @@ def momentum_engine(candles, current_atr, cfg):
             "size_atr": 0.0,
             "start": None,
             "end": None,
+            "impulse_low": None,
+            "impulse_high": None,
             "age": 0,
             "dir_ratio": 0.0,
         }
@@ -63,6 +66,8 @@ def momentum_engine(candles, current_atr, cfg):
             "size_atr": 0.0,
             "start": None,
             "end": None,
+            "impulse_low": None,
+            "impulse_high": None,
             "age": 0,
             "dir_ratio": 0.0,
         }
@@ -90,7 +95,6 @@ def momentum_engine(candles, current_atr, cfg):
 
         if direction == "BUY" and delta > 0:
             directional_bars += 1
-
         elif direction == "SELL" and delta < 0:
             directional_bars += 1
 
@@ -109,6 +113,8 @@ def momentum_engine(candles, current_atr, cfg):
         "size_atr": size_atr,
         "start": start,
         "end": end,
+        "impulse_low": min(c.low for c in window),
+        "impulse_high": max(c.high for c in window),
         "age": 0,
         "dir_ratio": dir_ratio,
     }
@@ -123,11 +129,15 @@ def fibonacci_engine(price, momentum, current_atr, cfg):
             "distance": None,
         }
 
-    start = momentum["start"]
-    end = momentum["end"]
-    direction = momentum["direction"]
+    impulse_low = momentum.get("impulse_low")
+    impulse_high = momentum.get("impulse_high")
+    direction = momentum.get("direction")
 
-    if start is None or end is None:
+    if (
+        impulse_low is None
+        or impulse_high is None
+        or direction not in ("BUY", "SELL")
+    ):
         return {
             "valid": False,
             "level": None,
@@ -135,7 +145,7 @@ def fibonacci_engine(price, momentum, current_atr, cfg):
             "distance": None,
         }
 
-    size = abs(end - start)
+    size = impulse_high - impulse_low
 
     if size <= 0:
         return {
@@ -146,23 +156,21 @@ def fibonacci_engine(price, momentum, current_atr, cfg):
         }
 
     if direction == "BUY":
-        depth = (end - price) / size
+        depth = (impulse_high - price) / size
     else:
-        depth = (price - end) / size
+        depth = (price - impulse_low) / size
 
     nearest = min(
         cfg.fib_levels,
-        key=lambda x: abs(x - depth),
+        key=lambda level: abs(level - depth),
     )
 
     distance = abs(depth - nearest)
 
-    tolerance = cfg.fib_tol_atr
-
-    if current_atr and current_atr > 0:
-        price_tolerance = tolerance * current_atr / size
+    if current_atr is not None and current_atr > 0:
+        price_tolerance = cfg.fib_tol_atr * current_atr / size
     else:
-        price_tolerance = tolerance
+        price_tolerance = cfg.fib_tol_atr
 
     valid = (
         depth >= min(cfg.fib_levels) - price_tolerance
@@ -218,7 +226,6 @@ def pullback_engine(
             0.0,
             momentum["end"] - min(c.low for c in recent),
         )
-
     else:
         counter_move = max(
             0.0,
